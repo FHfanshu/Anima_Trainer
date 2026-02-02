@@ -1,0 +1,81 @@
+# Anima Character LoRA 训练配置示例
+# ================================
+
+# 模型配置
+pretrained_model_name_or_path: "circlestone-labs/Anima"
+revision: null
+variant: null
+
+# LoRA 配置
+lora_type: "lora"  # 可选: "lora" (标准PEFT) 或 "lokr" (LyCORIS)
+lora_rank: 32
+lora_alpha: 32
+lora_dropout: 0.0
+lora_target_modules:
+  - "to_q"
+  - "to_k"
+  - "to_v"
+  - "to_out.0"
+  - "ff.net.0.proj"
+  - "ff.net.2"
+
+# LyCORIS LoKr 专用 (仅在 lora_type="lokr" 时使用)
+lokr_factor: 8
+lokr_use_effective_conv2d: true
+
+# 数据集配置
+data_root: "./data/character_dataset"
+resolution: 1024
+center_crop: true
+random_flip: true
+tag_dropout: 0.1
+
+# 训练配置
+output_dir: "./output/character_lora"
+seed: 42
+num_train_epochs: 100
+max_train_steps: null  # 如果设置，将覆盖 num_train_epochs
+train_batch_size: 1
+gradient_accumulation_steps: 4
+gradient_checkpointing: true
+
+# 优化器配置
+optimizer: "adamw8bit"  # 可选: "adamw8bit", "muon", "adamw"
+learning_rate: 1.0e-4
+scale_lr: true
+lr_scheduler: "cosine_with_restarts"
+lr_warmup_steps: 500
+lr_num_cycles: 1
+lr_power: 1.0
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 0.01
+adam_epsilon: 1.0e-8
+max_grad_norm: 1.0
+
+# 精度配置
+mixed_precision: "bf16"  # 可选: "no", "fp16", "bf16"
+
+# Flash Attention
+enable_flash_attention: true
+
+# Checkpoint 配置
+checkpointing_steps: 500
+checkpoints_total_limit: 5  # 保留最新的 5 个 checkpoint，null 表示不限制
+resume_from_checkpoint: null
+save_state: true
+
+# 验证配置
+validation_prompt: "1girl, oomuro sakurako, yuru yuri, brown hair, long hair, smile, best quality, masterpiece"
+validation_epochs: 5
+num_validation_images: 4
+
+# WandB 配置
+report_to: "wandb"
+wandb_project: "anima-lora-training"
+wandb_entity: null  # 你的 wandb 用户名或团队名
+tracker_run_name: null  # 自动命名
+
+# 其他配置
+dataloader_num_workers: 4
+min_snr_gamma: 5.0

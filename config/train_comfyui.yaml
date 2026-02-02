@@ -1,0 +1,23 @@
+# 从 ComfyUI 训练示例配置
+# =======================
+
+# ComfyUI 路径（优先使用）
+comfyui_path: "D:/ComfyUI"  # 修改为你的 ComfyUI 路径
+
+# 如果从 ComfyUI 加载失败，使用这个 HF 路径作为后备
+pretrained_model_name_or_path: "circlestone-labs/Anima"
+
+# 其他配置保持不变...
+lora_type: "lora"
+lora_rank: 32
+lora_alpha: 32
+data_root: "./data/character_dataset"
+output_dir: "./output/character_lora"
+num_train_epochs: 100
+learning_rate: 1.0e-4
+
+# 启用所有优化
+gradient_checkpointing: true
+enable_flash_attention: true
+optimizer: "adamw8bit"
+mixed_precision: "bf16"
