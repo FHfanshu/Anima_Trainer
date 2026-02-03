@@ -1,15 +1,13 @@
 # Anima Character LoRA Training Script
 
-一个完整的、生产级的 **Anima (Cosmos 架构)** Character LoRA 训练脚本，支持标准 PEFT LoRA 和 LyCORIS Lokr 两种模式。
+一个不完整的、不生产级的vibe出来的玩具， **Anima (Cosmos 架构)** Character LoRA 训练脚本，支持标准 PEFT LoRA 和 LyCORIS Lokr 两种模式。
 
 ## 特性
 
 - **双模式 LoRA 支持**: 标准 PEFT LoRA 和 LyCORIS Lokr
-- **双模式优化器**: 8-bit AdamW (bitsandbytes) 和 muon 优化器
-- **内存优化**: Gradient Checkpointing + Flash Attention 2
+- **内存优化**: Gradient Checkpointing
 - **标签数据集**: 支持 Danbooru 风格的 tag-based 数据集
-- **完整训练管理**: WandB 日志、自动 checkpoint、resume 支持
-- **单卡优化**: 专为 RTX 3090 优化，可训练 1024x1024 分辨率
+- **训练管理**: Tensorboard 日志、自动 checkpoint、resume 支持
 
 ## 安装
 
