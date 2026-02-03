@@ -1,197 +1,122 @@
-# Anima Character LoRA Training Script
+# Anima LoRA Trainer
 
-一个不完整的、不生产级的vibe出来的玩具， **Anima (Cosmos 架构)** Character LoRA 训练脚本，支持标准 PEFT LoRA 和 LyCORIS Lokr 两种模式。
+一个轻量级的 **Anima** LoRA/LoKr 训练脚本，支持 YAML 配置文件，输出兼容 ComfyUI。
 
 ## 特性
 
-- **双模式 LoRA 支持**: 标准 PEFT LoRA 和 LyCORIS Lokr
-- **内存优化**: Gradient Checkpointing
-- **标签数据集**: 支持 Danbooru 风格的 tag-based 数据集
-- **训练管理**: Tensorboard 日志、自动 checkpoint、resume 支持
+- **YAML 配置文件** - 通过 `--config` 加载配置
+- **LoRA / LoKr 双模式** - 标准 LoRA 和 LyCORIS LoKr
+- **ComfyUI 兼容** - 输出的 safetensors 可直接在 ComfyUI 中使用
+- **VAE Latent 缓存** - 自动缓存到 npz 文件，加速后续训练
+- **xformers 支持** - 可选启用 memory efficient attention
+- **Rich 进度条** - 实时显示 loss 曲线
 
 ## 安装
 
 ```bash
-# 克隆仓库
-git clone <repo-url>
+git clone https://github.com/FHfanshu/Anima_Trainer.git
 cd Anima_Trainer
 
-# 创建虚拟环境（推荐，Python 3.12）
-# Windows (PowerShell):
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -U pip uv
+# 创建虚拟环境
+python -m venv .venv
 
-# Linux/macOS:
-# python3.12 -m venv .venv
-# . .venv/bin/activate
-# python -m pip install -U pip uv
+# Windows
+.\.venv\Scripts\activate
 
 # 安装依赖
-uv pip install -r requirements.txt
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+pip install numpy Pillow safetensors transformers einops pyyaml rich tiktoken
+pip install xformers --index-url https://download.pytorch.org/whl/cu130
 ```
 
 ## 快速开始
 
-### 1. 准备数据集
-
-将数据集组织为以下结构：
+### 1. 准备模型文件
 
 ```
-data/
-└── character_dataset/
-    ├── image001.jpg
-    ├── image001.txt
-    ├── image002.png
-    ├── image002.txt
-    └── ...
+models/
+├── transformers/
+│   └── anima-preview.safetensors
+├── vae/
+│   └── qwen_image_vae.safetensors
+└── text_encoders/
+    └── (Qwen 模型文件)
 ```
 
-`.txt` 文件包含 Danbooru 风格的标签，例如：
+### 2. 准备数据集
 
 ```
-1girl, oomuro sakurako, yuru yuri, brown hair, long hair, smile, school uniform, ...
+dataset/
+├── image001.jpg
+├── image001.txt
+├── image002.png
+├── image002.txt
+└── ...
 ```
 
-### 2. 配置训练参数
+`.txt` 文件包含 Danbooru 风格标签。
 
-编辑 `config/train_config.yaml` 或直接修改启动脚本。
+### 3. 编辑配置文件
 
-### 3. 启动训练
+复制并编辑 `config/train_template.yaml`。
+
+### 4. 开始训练
 
 ```bash
-accelerate launch anima_train.py \
-  --pretrained_model_name_or_path="circlestone-labs/Anima" \
-  --data_root="./data/character_dataset" \
-  --output_dir="./output/character_lora" \
-  --lora_rank=32 \
-  --lora_alpha=32 \
-  --train_batch_size=1 \
-  --gradient_accumulation_steps=4 \
-  --num_train_epochs=100 \
-  --learning_rate=1e-4 \
-  --gradient_checkpointing \
-  --mixed_precision=bf16 \
-  --optimizer=adamw8bit
+python anima_train.py --config ./config/train_template.yaml
 ```
 
-## 项目结构
-
-```
-Anima_Trainer/
-├── anima_train.py           # 主训练脚本
-├── requirements.txt         # 依赖列表
-├── config/
-│   └── train_config.yaml    # 训练配置示例
-├── utils/
-│   ├── __init__.py
-│   ├── dataset.py           # 数据集处理
-│   ├── model_utils.py       # 模型加载和 LoRA 配置
-│   ├── optimizer_utils.py   # 优化器创建
-│   └── checkpoint.py        # Checkpoint 管理
-├── gui/                     # Web GUI (半成品)
-├── start_gui.py             # GUI 启动脚本
-└── start_gui.bat            # Windows GUI 启动
-```
-
-## 配置详解
-
-### LoRA 参数
-
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `--lora_type` | LoRA 类型: `lora` 或 `lokr` | `lora` |
-| `--lora_rank` | LoRA rank (4-128) | `32` |
-| `--lora_alpha` | LoRA alpha (通常为 rank 的 1-2 倍) | `32` |
-| `--lora_dropout` | Dropout 概率 | `0.0` |
-
-### 优化器选择
-
-| 优化器 | 命令 | 说明 |
-|--------|------|------|
-| 8-bit AdamW | `--optimizer=adamw8bit` | 推荐，节省显存 |
-| 标准 AdamW | `--optimizer=adamw` | 后备选项 |
-
-### 内存优化
-
-- **Gradient Checkpointing**: `--gradient_checkpointing` (推荐开启)
-- **8-bit Optimizer**: `--optimizer=adamw8bit`
-
-### Resume from Checkpoint
+命令行参数可覆盖配置文件：
 
 ```bash
-accelerate launch anima_train.py \
-  --resume_from_checkpoint="./output/checkpoints/checkpoint-1000" \
-  ...
+python anima_train.py --config ./config/train_template.yaml --lr 5e-5
+```
+
+## 配置说明
+
+```yaml
+# 模型路径
+transformer_path: "models/transformers/anima-preview.safetensors"
+vae_path: "models/vae/qwen_image_vae.safetensors"
+text_encoder_path: "models/text_encoders"
+
+# 数据集
+data_dir: "./dataset"
+resolution: 1024
+repeats: 10
+shuffle_caption: true
+cache_latents: true
+
+# LoRA
+lora_type: "lokr"      # lora 或 lokr
+lora_rank: 32
+lora_alpha: 32
+
+# 训练
+epochs: 50
+batch_size: 1
+grad_accum: 4
+learning_rate: 1e-4
+mixed_precision: "bf16"
+grad_checkpoint: true
+xformers: true
+
+# 保存
+output_dir: "./output"
+save_every: 5          # 每 N 个 epoch 保存
+sample_every: 5        # 每 N 个 epoch 采样
 ```
 
 ## 硬件要求
 
-- **GPU**: 24GB+ 显存
-- **内存**: 32GB+ RAM
+- GPU: 24GB+ 显存 (RTX 3090/4090)
+- RAM: 32GB+
 
-## 最佳实践
+## 致谢
 
-### 1. 学习率
-
-- 单卡 RTX 3090: `1e-4` ~ `5e-4`
-- 使用梯度累积时: `1e-4` (已自动缩放)
-
-### 2. LoRA Rank
-
-- 角色训练: `rank=32` ~ `64`, `alpha=32` ~ `64`
-- 风格训练: `rank=64` ~ `128`, `alpha=64` ~ `128`
-
-### 3. 数据集大小
-
-- 最小推荐: 20-30 张高质量图片
-- 理想范围: 50-200 张
-- 标签质量比数量更重要
-
-### 4. Tag 格式
-
-遵循 Danbooru 格式：
-
-```
-[质量标签] [角色标签] [系列标签] [一般标签]
-
-例如：
-masterpiece, best quality, 1girl, oomuro sakurako, yuru yuri, 
-brown hair, long hair, smile, school uniform, sitting, ...
-```
-
-## Troubleshooting
-
-### 1. CUDA Out of Memory
-
-- 降低分辨率: `--resolution=896`
-- 增加梯度累积: `--gradient_accumulation_steps=8`
-- 使用 8-bit 优化器: `--optimizer=adamw8bit`
-- 确保启用 gradient checkpointing: `--gradient_checkpointing`
-
-### 2. 训练不稳定
-
-- 降低学习率: `--learning_rate=5e-5`
-- 增加 warmup: `--lr_warmup_steps=1000`
-- 使用 bf16 而不是 fp16: `--mixed_precision=bf16`
-
-### 3. Checkpoint 加载失败
-
-- 检查路径是否正确
-- 确保使用相同的模型和 LoRA 配置
-- 查看日志获取详细错误信息
-
-## 高级用法
-
-### 使用配置文件
-
-```bash
-accelerate launch train_v2.py --config_file=config/train_config.yaml
-```
+- 本项目参考了网络上流传的 Anima 训练脚本，原作者不详，如有侵权请联系删除
+- [Claude Opus 4.5](https://claude.ai) - AI 编程助手
 
 ## License
 
-MIT License。Anima 模型本身的使用请遵循其官方许可证。
-
-## Contributors
-
-- [Claude Opus 4.5](https://claude.ai) - AI pair programmer
+MIT License
