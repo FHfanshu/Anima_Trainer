@@ -5,7 +5,7 @@ Anima Character LoRA 训练脚本
 专门为训练 circlestone-labs/Anima 的 Character LoRA 设计。
 
 特性：
-- 支持 8-bit AdamW (bitsandbytes) 和 muon 优化器
+- 支持 8-bit AdamW (bitsandbytes) 优化器
 - 支持 gradient checkpointing 和 Flash Attention 2
 - 支持 tag-based 数据集
 - 完整的 WandB 日志和 checkpoint 管理
@@ -24,7 +24,7 @@ import math
 import random
 from pathlib import Path
 from typing import Optional, Dict, Any, List
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 import gc
 import json
 
@@ -39,7 +39,7 @@ from diffusers import (
     AutoencoderKLCosmos,
     CosmosTransformer3DModel,
     FlowMatchEulerDiscreteScheduler,
-    CosmosPipeline,
+    DiffusionPipeline,
 )
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
@@ -48,10 +48,6 @@ from diffusers.training_utils import EMAModel, cast_training_params
 # PEFT 相关 (LoRA)
 from peft import LoraConfig, get_peft_model, PeftModel
 from peft.utils import get_peft_model_state_dict
-
-# LyCORIS (LoKr) 相关
-from lycoris.kohya import create_network_from_weights
-from lycoris.config import PRESET_NETWORK_CONFIGS
 
 # Accelerate 相关
 from accelerate import Accelerator
@@ -75,8 +71,23 @@ from PIL import Image
 from tqdm.auto import tqdm
 from omegaconf import OmegaConf
 
+try:
+    import tomllib  # Python 3.11+
+except ImportError:  # pragma: no cover - fallback for Python 3.10
+    tomllib = None
+
+try:
+    import tomli  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    tomli = None
+
+try:
+    import yaml  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    yaml = None
+
 # 导入自定义模块
-from utils.dataset import TagBasedDataset
+from utils.dataset import TagBasedDataset, CachedTagBasedDataset, BucketBatchSampler, collate_fn
 from utils.model_utils import load_anima_pipeline, setup_lora_adapters
 from utils.optimizer_utils import create_optimizer
 from utils.checkpoint import CheckpointManager
@@ -87,6 +98,40 @@ check_min_version("0.32.0")
 
 # 获取 logger
 logger = get_logger(__name__, log_level="INFO")
+
+
+def configure_torch_backends(enable_flash_attention: bool) -> None:
+    """Configure PyTorch backends for speed.
+
+    Notes:
+    - Cosmos uses PyTorch SDPA (scaled_dot_product_attention). On CUDA, PyTorch can select
+      Flash-SDP / MemEff-SDP kernels when enabled and supported.
+    - This is independent from the external `flash-attn` package.
+    """
+
+    if not torch.cuda.is_available():
+        return
+
+    # TF32 can speed up some fp32 matmuls/convs on Ampere+.
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+    # Prefer faster SDPA kernels when possible.
+    try:
+        if enable_flash_attention:
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(True)
+        else:
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+            torch.backends.cuda.enable_math_sdp(True)
+    except Exception:
+        pass
 
 
 @dataclass
@@ -166,6 +211,34 @@ class TrainingConfig:
         default=True,
         metadata={"help": "是否随机水平翻转图像用于数据增强"}
     )
+
+    # Latent 缓存（默认开启：只训练 DiT/UNet，节省 VAE 编码时间）
+    cache_latents: bool = field(
+        default=True,
+        metadata={"help": "是否预先缓存 VAE latent（更快，但会占用内存）"}
+    )
+
+    # ARB (aspect ratio bucketing)
+    enable_arb: bool = field(
+        default=False,
+        metadata={"help": "是否启用 ARB（按长宽比分桶训练）"}
+    )
+    min_bucket_reso: int = field(
+        default=512,
+        metadata={"help": "ARB 最小桶分辨率（像素，宽/高均在该范围内）"}
+    )
+    max_bucket_reso: int = field(
+        default=1024,
+        metadata={"help": "ARB 最大桶分辨率（像素，宽/高均在该范围内）"}
+    )
+    bucket_reso_steps: int = field(
+        default=64,
+        metadata={"help": "ARB 桶分辨率步进（建议 64；会对齐到 8）"}
+    )
+    bucket_no_upscale: bool = field(
+        default=False,
+        metadata={"help": "ARB 是否避免把小图 upscale 到更大桶（可能导致桶选择受限）"}
+    )
     
     # 训练参数
     output_dir: str = field(
@@ -200,7 +273,7 @@ class TrainingConfig:
     # 优化器参数
     optimizer: str = field(
         default="adamw8bit",
-        metadata={"help": "优化器类型: 'adamw8bit' (8-bit AdamW) 或 'muon'"}
+        metadata={"help": "优化器类型: 'adamw8bit' (8-bit AdamW) 或 'adamw'"}
     )
     learning_rate: float = field(
         default=1e-4,
@@ -262,7 +335,11 @@ class TrainingConfig:
     # Checkpoint 参数
     checkpointing_steps: int = field(
         default=500,
-        metadata={"help": "每多少步保存一次 checkpoint"}
+        metadata={"help": "每多少 step 保存一次 checkpoint（0 表示禁用）"}
+    )
+    checkpointing_epochs: int = field(
+        default=0,
+        metadata={"help": "每多少个 epoch 保存一次 checkpoint（0 表示禁用）"}
     )
     checkpoints_total_limit: Optional[int] = field(
         default=None,
@@ -289,8 +366,8 @@ class TrainingConfig:
     
     # WandB 参数
     report_to: str = field(
-        default="wandb",
-        metadata={"help": "报告工具: 'wandb', 'tensorboard', 'all', 'none'"}
+        default="tensorboard",
+        metadata={"help": "报告工具: 'tensorboard', 'wandb', 'all', 'none'"}
     )
     wandb_project: str = field(
         default="anima-lora-training",
@@ -341,6 +418,13 @@ def parse_args() -> TrainingConfig:
     parser = argparse.ArgumentParser(
         description="Anima Character LoRA Training Script",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    parser.add_argument(
+        "--config_file",
+        type=str,
+        default=None,
+        help="Path to a TOML/YAML config file"
     )
     
     # 模型参数
@@ -441,6 +525,38 @@ def parse_args() -> TrainingConfig:
         default=True,
         help="是否随机水平翻转图像用于数据增强"
     )
+
+    # ARB (aspect ratio bucketing)
+    parser.add_argument(
+        "--enable_arb",
+        action="store_true",
+        default=False,
+        help="启用 ARB（按长宽比分桶训练）"
+    )
+    parser.add_argument(
+        "--min_bucket_reso",
+        type=int,
+        default=512,
+        help="ARB 最小桶分辨率（像素）"
+    )
+    parser.add_argument(
+        "--max_bucket_reso",
+        type=int,
+        default=1024,
+        help="ARB 最大桶分辨率（像素）"
+    )
+    parser.add_argument(
+        "--bucket_reso_steps",
+        type=int,
+        default=64,
+        help="ARB 桶分辨率步进（建议 64；会对齐到 8）"
+    )
+    parser.add_argument(
+        "--bucket_no_upscale",
+        action="store_true",
+        default=False,
+        help="ARB 避免 upscale（更接近 kohya 的 no_upscale 行为）"
+    )
     parser.add_argument(
         "--no_center_crop",
         action="store_false",
@@ -452,6 +568,19 @@ def parse_args() -> TrainingConfig:
         action="store_false",
         dest="random_flip",
         help="禁用随机翻转"
+    )
+
+    parser.add_argument(
+        "--cache_latents",
+        action="store_true",
+        default=True,
+        help="缓存 VAE latent（默认开启）"
+    )
+    parser.add_argument(
+        "--no_cache_latents",
+        action="store_false",
+        dest="cache_latents",
+        help="禁用 latent 缓存（会在每步运行 VAE encode）"
     )
     
     # 训练参数
@@ -509,8 +638,8 @@ def parse_args() -> TrainingConfig:
         "--optimizer",
         type=str,
         default="adamw8bit",
-        choices=["adamw8bit", "muon"],
-        help="优化器类型: 'adamw8bit' (8-bit AdamW) 或 'muon'"
+        choices=["adamw8bit", "adamw"],
+        help="优化器类型: 'adamw8bit' (8-bit AdamW) 或 'adamw'"
     )
     parser.add_argument(
         "--learning_rate",
@@ -614,7 +743,13 @@ def parse_args() -> TrainingConfig:
         "--checkpointing_steps",
         type=int,
         default=500,
-        help="每多少步保存一次 checkpoint"
+        help="每多少 step 保存一次 checkpoint（0 表示禁用）"
+    )
+    parser.add_argument(
+        "--checkpointing_epochs",
+        type=int,
+        default=0,
+        help="每多少个 epoch 保存一次 checkpoint（0 表示禁用）"
     )
     parser.add_argument(
         "--checkpoints_total_limit",
@@ -653,8 +788,8 @@ def parse_args() -> TrainingConfig:
     parser.add_argument(
         "--report_to",
         type=str,
-        default="wandb",
-        choices=["wandb", "tensorboard", "all", "none"],
+        default="tensorboard",
+        choices=["tensorboard", "wandb", "all", "none"],
         help="报告工具"
     )
     parser.add_argument(
@@ -708,12 +843,60 @@ def parse_args() -> TrainingConfig:
         help="Min-SNR 加权策略的 gamma 参数"
     )
     
+    args, _ = parser.parse_known_args()
+
+    config_overrides: Dict[str, Any] = {}
+    if args.config_file:
+        config_overrides = _load_config_file(args.config_file)
+        config_overrides = _filter_config_overrides(config_overrides)
+        parser.set_defaults(**config_overrides)
+
     args = parser.parse_args()
-    
+
     # 转换为 TrainingConfig
-    config = TrainingConfig(**vars(args))
+    args_dict = vars(args)
+    args_dict.pop("config_file", None)
+    config = TrainingConfig(**args_dict)
     
     return config
+
+
+def _training_config_keys() -> set[str]:
+    return {field_obj.name for field_obj in fields(TrainingConfig)}
+
+
+def _filter_config_overrides(config_data: Dict[str, Any]) -> Dict[str, Any]:
+    valid_keys = _training_config_keys()
+    unknown_keys = sorted(set(config_data.keys()) - valid_keys)
+    if unknown_keys:
+        print(f"[WARN] Ignoring unknown config keys: {', '.join(unknown_keys)}")
+    return {key: value for key, value in config_data.items() if key in valid_keys}
+
+
+def _load_config_file(config_path: str) -> Dict[str, Any]:
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+
+    suffix = path.suffix.lower()
+    if suffix in {".yaml", ".yml"}:
+        if yaml is None:
+            raise RuntimeError("YAML support not available. Install PyYAML or use TOML.")
+        with path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    elif suffix == ".toml":
+        toml_reader = tomllib or tomli
+        if toml_reader is None:
+            raise RuntimeError("TOML support not available. Use Python 3.11+ or install tomli.")
+        with path.open("rb") as f:
+            data = toml_reader.load(f)
+    else:
+        raise ValueError("Unsupported config file format. Use .toml or .yaml/.yml.")
+
+    if not isinstance(data, dict):
+        raise ValueError("Config file must contain a top-level mapping/object.")
+
+    return data
 
 
 def main():
@@ -726,6 +909,8 @@ def main():
     # =========================================================================
     # 为什么先解析参数：确保所有配置在初始化前就位
     config = parse_args()
+
+    configure_torch_backends(enable_flash_attention=config.enable_flash_attention)
     
     # 创建输出目录
     os.makedirs(config.output_dir, exist_ok=True)
@@ -787,10 +972,15 @@ def main():
     logger.info(f"World size: {accelerator.num_processes}")
     
     # 如果使用 wandb，只在主进程初始化
-    if accelerator.is_main_process:
-        tracker_config = vars(config)
+    if accelerator.is_main_process and config.report_to:
+        # Filter config for tensorboard compatibility (only scalar types allowed)
+        tracker_config = {
+            k: v for k, v in vars(config).items()
+            if isinstance(v, (int, float, str, bool)) and v is not None
+        }
+        project_name = config.wandb_project or "anima-lora-training"
         accelerator.init_trackers(
-            config.wandb_project,
+            project_name,
             config=tracker_config,
             init_kwargs={
                 "wandb": {
@@ -881,7 +1071,14 @@ def main():
     
     # 打印可训练参数信息
     if accelerator.is_main_process:
-        transformer.print_trainable_parameters()
+        if hasattr(transformer, "print_trainable_parameters"):
+            transformer.print_trainable_parameters()
+        else:
+            trainable_params = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in transformer.parameters())
+            logger.info(
+                f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)"
+            )
     
     # =========================================================================
     # 第七步：启用梯度检查点
@@ -912,23 +1109,70 @@ def main():
     
     logger.info("Loading dataset...")
     
-    train_dataset = TagBasedDataset(
-        data_root=config.data_root,
-        tokenizer=tokenizer,
-        resolution=config.resolution,
-        center_crop=config.center_crop,
-        random_flip=config.random_flip,
-        tag_dropout=config.tag_dropout,
-    )
-    
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=config.train_batch_size,
-        shuffle=True,
-        num_workers=config.dataloader_num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
+    if config.cache_latents:
+        train_dataset = CachedTagBasedDataset(
+            data_root=config.data_root,
+            tokenizer=tokenizer,
+            vae=vae,
+            device=accelerator.device,
+            resolution=config.resolution,
+            center_crop=config.center_crop,
+            random_flip=config.random_flip,
+            tag_dropout=config.tag_dropout,
+            enable_arb=config.enable_arb,
+            min_bucket_reso=config.min_bucket_reso,
+            max_bucket_reso=config.max_bucket_reso,
+            bucket_reso_steps=config.bucket_reso_steps,
+            bucket_no_upscale=config.bucket_no_upscale,
+        )
+        logger.info("Using cached-latents dataset")
+    else:
+        train_dataset = TagBasedDataset(
+            data_root=config.data_root,
+            tokenizer=tokenizer,
+            resolution=config.resolution,
+            center_crop=config.center_crop,
+            random_flip=config.random_flip,
+            tag_dropout=config.tag_dropout,
+            enable_arb=config.enable_arb,
+            min_bucket_reso=config.min_bucket_reso,
+            max_bucket_reso=config.max_bucket_reso,
+            bucket_reso_steps=config.bucket_reso_steps,
+            bucket_no_upscale=config.bucket_no_upscale,
+        )
+
+    if config.enable_arb and accelerator.num_processes == 1:
+        batch_sampler = BucketBatchSampler(
+            train_dataset,
+            batch_size=config.train_batch_size,
+            drop_last=True,
+            shuffle=True,
+            seed=config.seed,
+        )
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_sampler=batch_sampler,
+            num_workers=config.dataloader_num_workers,
+            pin_memory=True,
+            collate_fn=collate_fn,
+            prefetch_factor=2 if config.dataloader_num_workers > 0 else None,
+            persistent_workers=config.dataloader_num_workers > 0,
+        )
+        logger.info("ARB enabled: using bucketed batch sampler")
+    else:
+        if config.enable_arb and accelerator.num_processes != 1:
+            logger.warning("ARB is enabled but multiple processes are active; falling back to non-ARB dataloader")
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=config.train_batch_size,
+            shuffle=True,
+            num_workers=config.dataloader_num_workers,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=collate_fn,
+            prefetch_factor=2 if config.dataloader_num_workers > 0 else None,
+            persistent_workers=config.dataloader_num_workers > 0,
+        )
     
     logger.info(f"Dataset loaded: {len(train_dataset)} samples")
     
@@ -959,11 +1203,19 @@ def main():
     # 根据配置选择优化器：
     # - 8-bit AdamW: bitsandbytes 库提供，将优化器状态量化为 8-bit
     #   可减少约 50% 的优化器显存占用
-    # - muon: 一种新的优化器，针对现代硬件优化
+    # - adamw: 标准 AdamW 优化器
     #
     # 注意：只有 LoRA 参数是可训练的
-    
+    # 对于 LyCORIS，参数存储在 _lycoris 属性中，需要单独收集
+
     params_to_optimize = list(filter(lambda p: p.requires_grad, transformer.parameters()))
+
+    # 如果使用 LyCORIS，需要额外收集 _lycoris 的参数
+    unwrapped_for_params = accelerator.unwrap_model(transformer)
+    if hasattr(unwrapped_for_params, "_lycoris") and unwrapped_for_params._lycoris is not None:
+        lycoris_params = list(unwrapped_for_params._lycoris.parameters())
+        params_to_optimize = lycoris_params
+        logger.info(f"Using LyCORIS parameters: {len(lycoris_params)} tensors")
     
     # 缩放学习率
     # 如果使用多 GPU 或大 batch size，需要相应调整学习率
@@ -1040,6 +1292,7 @@ def main():
         global_step, starting_epoch = checkpoint_manager.load_checkpoint(
             checkpoint_path=config.resume_from_checkpoint,
             accelerator=accelerator,
+            transformer=transformer,
             logger=logger,
         )
     
@@ -1050,19 +1303,25 @@ def main():
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {config.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {config.train_batch_size}")
-    logger.add(f"  Total train batch size (w. parallel, distributed & accumulation) = {config.train_batch_size * accelerator.num_processes * config.gradient_accumulation_steps}")
-    logger.add(f"  Gradient Accumulation steps = {config.gradient_accumulation_steps}")
-    logger.add(f"  Total optimization steps = {config.max_train_steps}")
+    logger.info(
+        "  Total train batch size (w. parallel, distributed & accumulation) = "
+        f"{config.train_batch_size * accelerator.num_processes * config.gradient_accumulation_steps}"
+    )
+    logger.info(f"  Gradient Accumulation steps = {config.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {config.max_train_steps}")
     
     # 仅在主进程显示进度条
     progress_bar = tqdm(
         range(global_step, config.max_train_steps),
         disable=not accelerator.is_local_main_process,
+        ascii=True,  # Use ASCII characters for Windows compatibility
     )
     progress_bar.set_description("Steps")
     
     # 训练循环
     for epoch in range(starting_epoch, config.num_train_epochs):
+        if hasattr(train_dataloader, "batch_sampler") and hasattr(train_dataloader.batch_sampler, "set_epoch"):
+            train_dataloader.batch_sampler.set_epoch(epoch)
         transformer.train()
         
         for step, batch in enumerate(train_dataloader):
@@ -1074,48 +1333,81 @@ def main():
                 # VAE 将图像编码为低维 latent 表示
                 # Anima 使用的 latent 空间维度比像素空间小得多（通常 8x 压缩）
                 
-                pixel_values = batch["pixel_values"].to(accelerator.device)
-                
-                # 转换为 latent
-                with torch.no_grad():
-                    latents = vae.encode(pixel_values).latent_dist.sample()
-                    latents = latents * vae.config.scaling_factor
+                # 获取或计算 latent
+                if batch.get("latents") is not None:
+                    latents = batch["latents"].to(accelerator.device, dtype=weight_dtype)
+                else:
+                    pixel_values = batch["pixel_values"].to(accelerator.device, dtype=weight_dtype)
+                    # QwenImage VAE expects [B, C, T, H, W] for images too.
+                    pixel_values = pixel_values.unsqueeze(2)
+                    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=weight_dtype):
+                        latents = vae.encode(pixel_values).latent_dist.sample()
+                        scale = getattr(getattr(vae, "config", None), "scaling_factor", None)
+                        if scale is not None:
+                            latents = latents * scale
                 
                 # -----------------------------------------------------------------
                 # 2. 编码文本提示
                 # -----------------------------------------------------------------
                 # 使用文本编码器将标签转换为 embedding
                 
-                prompt_embeds = text_encoder(batch["input_ids"].to(accelerator.device))[0]
+                if text_encoder is None:
+                    raise RuntimeError("Text encoder is required for training but was not loaded.")
+
+                input_ids = batch["input_ids"].to(accelerator.device)
+                attention_mask = batch.get("attention_mask")
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(accelerator.device)
+
+                with torch.no_grad(), torch.autocast(device_type="cuda", dtype=weight_dtype):
+                    te_out = text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+                    prompt_embeds = getattr(te_out, "last_hidden_state", te_out[0])
                 
                 # -----------------------------------------------------------------
                 # 3. 添加噪声（前向扩散过程）
                 # -----------------------------------------------------------------
                 # 扩散模型的训练目标是预测添加的噪声
                 # 使用 Flow Matching 调度器（Anima 基于 Cosmos，使用流匹配）
-                
+
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
-                
-                # 随机采样时间步
-                timesteps = torch.randint(
-                    0, scheduler.config.num_train_timesteps, (bsz,),
-                    device=latents.device
-                )
-                timesteps = timesteps.long()
-                
-                # 添加噪声
-                noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+
+                # 随机采样时间步 (0 to 1 for flow matching)
+                # Use continuous timesteps for flow matching training
+                u = torch.rand(bsz, device=latents.device, dtype=latents.dtype)
+                # Reshape for broadcasting: [B, 1, 1, 1, 1] for 5D latents
+                u_expanded = u.view(bsz, 1, 1, 1, 1)
+
+                # Flow matching interpolation: x_t = (1 - t) * x_0 + t * noise
+                noisy_latents = (1 - u_expanded) * latents + u_expanded * noise
+
+                # Convert to discrete timesteps for model input
+                num_train_timesteps = scheduler.config.num_train_timesteps
+                timesteps = (u * num_train_timesteps).long()
+                timesteps = timesteps.clamp(0, num_train_timesteps - 1)
                 
                 # -----------------------------------------------------------------
                 # 4. 模型预测
                 # -----------------------------------------------------------------
                 # Transformer 预测噪声或 velocity（取决于调度器配置）
-                
+
+                padding_mask = batch.get("padding_mask")
+                if padding_mask is not None:
+                    padding_mask = padding_mask.to(accelerator.device, dtype=weight_dtype)
+                elif getattr(getattr(transformer, "config", None), "concat_padding_mask", False):
+                    # Cosmos transformer expects padding_mask shape (1, 1, H, W)
+                    # It will be expanded internally to match batch size
+                    padding_mask = torch.ones(
+                        (1, 1, noisy_latents.shape[-2], noisy_latents.shape[-1]),
+                        device=noisy_latents.device,
+                        dtype=noisy_latents.dtype,
+                    )
+
                 model_pred = transformer(
                     hidden_states=noisy_latents,
                     timestep=timesteps,
                     encoder_hidden_states=prompt_embeds,
+                    padding_mask=padding_mask,
                 ).sample
                 
                 # -----------------------------------------------------------------
@@ -1147,8 +1439,11 @@ def main():
                     accelerator.clip_grad_norm_(transformer.parameters(), config.max_grad_norm)
                 
                 optimizer.step()
-                lr_scheduler.step()
                 optimizer.zero_grad()
+
+            # LR scheduler step should happen once per optimizer step, not per forward pass
+            if accelerator.sync_gradients:
+                lr_scheduler.step()
             
             # -----------------------------------------------------------------
             # 7. 更新进度
@@ -1170,7 +1465,7 @@ def main():
                 # -----------------------------------------------------------------
                 # 8. 保存 checkpoint
                 # -----------------------------------------------------------------
-                if global_step % config.checkpointing_steps == 0:
+                if config.checkpointing_steps > 0 and global_step % config.checkpointing_steps == 0:
                     if accelerator.is_main_process:
                         checkpoint_manager.save_checkpoint(
                             accelerator=accelerator,
@@ -1204,6 +1499,21 @@ def main():
                 epoch=epoch,
                 global_step=global_step,
             )
+
+        # -----------------------------------------------------------------
+        # 10. 保存 checkpoint（按 epoch）
+        # -----------------------------------------------------------------
+        if config.checkpointing_epochs > 0 and (epoch + 1) % config.checkpointing_epochs == 0:
+            if accelerator.is_main_process:
+                checkpoint_manager.save_checkpoint(
+                    accelerator=accelerator,
+                    transformer=transformer,
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
+                    global_step=global_step,
+                    epoch=epoch,
+                )
+                logger.info(f"Saved checkpoint at epoch {epoch + 1} (step {global_step})")
         
         # 检查是否达到最大步数
         if global_step >= config.max_train_steps:
@@ -1230,8 +1540,10 @@ def main():
         else:
             # LyCORIS 使用不同的保存方法
             lycoris_path = os.path.join(lora_output_dir, "lycoris_weights.pt")
-            # 这里需要调用 LyCORIS 特定的保存方法
-            torch.save(get_peft_model_state_dict(unwrapped_transformer), lycoris_path)
+            lycoris_net = getattr(unwrapped_transformer, "_lycoris", None)
+            if lycoris_net is None:
+                raise RuntimeError("LoKr selected but LyCORIS network was not initialized on transformer.")
+            torch.save(lycoris_net.state_dict(), lycoris_path)
         
         logger.info(f"Model saved to {lora_output_dir}")
         
@@ -1263,13 +1575,34 @@ def compute_snr(scheduler, timesteps):
     Returns:
         snr: 信噪比张量
     """
-    alphas_cumprod = scheduler.alphas_cumprod.to(timesteps.device)
-    sqrt_alphas_cumprod = alphas_cumprod[timesteps] ** 0.5
-    sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod[timesteps]) ** 0.5
-    
-    # SNR = alpha^2 / sigma^2
-    snr = (sqrt_alphas_cumprod / sqrt_one_minus_alphas_cumprod) ** 2
-    return snr
+    if hasattr(scheduler, "alphas_cumprod"):
+        alphas_cumprod = scheduler.alphas_cumprod.to(timesteps.device)
+        sqrt_alphas_cumprod = alphas_cumprod[timesteps] ** 0.5
+        sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod[timesteps]) ** 0.5
+
+        # SNR = alpha^2 / sigma^2
+        snr = (sqrt_alphas_cumprod / sqrt_one_minus_alphas_cumprod) ** 2
+        return snr
+
+    # FlowMatch scheduler (uses sigmas)
+    if hasattr(scheduler, "sigmas") and scheduler.sigmas is not None:
+        sigmas = scheduler.sigmas.to(device=timesteps.device, dtype=torch.float32)
+        num_sigmas = len(sigmas)
+
+        # For flow matching, compute sigma from continuous timesteps
+        # timesteps are discrete indices; convert to sigma values safely
+        num_train_timesteps = getattr(scheduler.config, "num_train_timesteps", 1000)
+
+        # Clamp indices to valid range
+        step_indices = timesteps.clamp(0, num_sigmas - 1).long()
+        sigma = sigmas[step_indices].to(timesteps.device)
+
+        # Avoid division by zero
+        sigma = sigma.clamp(min=1e-8)
+        snr = ((1.0 - sigma) / sigma) ** 2
+        return snr
+
+    return torch.ones_like(timesteps, dtype=torch.float32)
 
 
 def run_validation(
@@ -1295,46 +1628,47 @@ def run_validation(
     """
     # 切换到评估模式
     pipeline.transformer.eval()
-    
+
     validation_dir = os.path.join(output_dir, "validation")
     os.makedirs(validation_dir, exist_ok=True)
-    
+
     generator = torch.Generator(device=accelerator.device).manual_seed(42)
-    
+
     images = []
-    for i in range(num_images):
-        with torch.no_grad():
-            image = pipeline(
-                prompt=prompt,
-                num_inference_steps=30,
-                generator=generator,
-            ).images[0]
-        
-        # 保存图像
-        image_path = os.path.join(
-            validation_dir,
-            f"epoch{epoch}_step{global_step}_sample{i}.png"
-        )
-        image.save(image_path)
-        images.append(image)
-    
-    # 记录到 WandB
-    if accelerator.is_main_process and accelerator.trackers is not None:
-        for tracker in accelerator.trackers:
-            if tracker.name == "wandb":
-                import wandb
-                tracker.log(
-                    {
-                        f"validation_epoch_{epoch}": [
-                            wandb.Image(img, caption=f"Sample {i}: {prompt}")
-                            for i, img in enumerate(images)
-                        ]
-                    },
-                    step=global_step,
-                )
-    
-    # 切换回训练模式
-    pipeline.transformer.train()
+    try:
+        for i in range(num_images):
+            with torch.no_grad():
+                image = pipeline(
+                    prompt=prompt,
+                    num_inference_steps=30,
+                    generator=generator,
+                ).images[0]
+
+            # 保存图像
+            image_path = os.path.join(
+                validation_dir,
+                f"epoch{epoch}_step{global_step}_sample{i}.png"
+            )
+            image.save(image_path)
+            images.append(image)
+
+        # 记录到 WandB
+        if accelerator.is_main_process and accelerator.trackers is not None:
+            for tracker in accelerator.trackers:
+                if tracker.name == "wandb":
+                    import wandb
+                    tracker.log(
+                        {
+                            f"validation_epoch_{epoch}": [
+                                wandb.Image(img, caption=f"Sample {i}: {prompt}")
+                                for i, img in enumerate(images)
+                            ]
+                        },
+                        step=global_step,
+                    )
+    finally:
+        # 切换回训练模式（确保即使出错也能恢复）
+        pipeline.transformer.train()
 
 
 if __name__ == "__main__":

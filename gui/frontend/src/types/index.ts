@@ -10,6 +10,7 @@ export interface OptimizerConfig {
 }
 
 export interface NetworkConfig {
+  network_type: 'lora' | 'lokr'
   network_module: string
   network_dim: number
   network_alpha: number

@@ -3,16 +3,10 @@ Optimizer Utils Module - 优化器创建
 ===================================
 支持多种优化器：
 1. 8-bit AdamW (bitsandbytes) - 内存高效
-2. muon - 实验性优化器
-3. 标准 AdamW - 后备选项
-
-优化器选择对训练效果有重要影响：
-- 8-bit AdamW: 在减少内存占用的同时保持性能
-- muon: 新兴的优化器，声称在某些任务上收敛更快
+2. 标准 AdamW - 后备选项
 """
 
 from typing import List, Dict, Any, Optional, Iterator
-import warnings
 
 import torch
 from torch import nn
@@ -24,14 +18,6 @@ try:
     BITSANDBYTES_AVAILABLE = True
 except ImportError:
     BITSANDBYTES_AVAILABLE = False
-    warnings.warn("bitsandbytes not available. 8-bit optimizers will not work.")
-
-# 尝试导入 muon
-try:
-    from muon import Muon
-    MUON_AVAILABLE = True
-except ImportError:
-    MUON_AVAILABLE = False
 
 
 def create_optimizer(
@@ -45,28 +31,28 @@ def create_optimizer(
 ) -> Optimizer:
     """
     创建优化器
-    
+
     根据配置创建不同类型的优化器。这是工厂模式的应用，
     将优化器创建逻辑集中管理，便于维护和扩展。
-    
+
     Args:
-        optimizer_type: 优化器类型 ("adamw8bit", "muon", "adamw")
+        optimizer_type: 优化器类型 ("adamw8bit", "adamw")
         params: 模型参数迭代器
         learning_rate: 学习率
         betas: Adam beta 参数 (beta1, beta2)
         weight_decay: 权重衰减系数
         eps: 数值稳定性 epsilon
         **kwargs: 其他优化器特定参数
-        
+
     Returns:
         Optimizer: 创建的优化器实例
-        
+
     Raises:
         ValueError: 如果优化器类型不支持
         ImportError: 如果需要的库未安装
     """
     optimizer_type = optimizer_type.lower()
-    
+
     if optimizer_type == "adamw8bit":
         return create_8bit_adamw(
             params=params,
@@ -76,15 +62,7 @@ def create_optimizer(
             eps=eps,
             **kwargs
         )
-    
-    elif optimizer_type == "muon":
-        return create_muon(
-            params=params,
-            lr=learning_rate,
-            weight_decay=weight_decay,
-            **kwargs
-        )
-    
+
     elif optimizer_type == "adamw":
         return create_standard_adamw(
             params=params,
@@ -94,11 +72,11 @@ def create_optimizer(
             eps=eps,
             **kwargs
         )
-    
+
     else:
         raise ValueError(
             f"Unknown optimizer type: {optimizer_type}. "
-            f"Choose from: adamw8bit, muon, adamw"
+            f"Choose from: adamw8bit, adamw"
         )
 
 
@@ -169,61 +147,7 @@ def create_8bit_adamw(
     # 8-bit 优化器状态：约 2 bytes per parameter (vs 8 bytes for 32-bit)
     # 节省约 75% 的优化器状态内存
     estimated_savings_gb = (total_params * 6) / (1024 ** 3)  # 节省 6 bytes per param
-    print(f"  ✓ 8-bit AdamW created (estimated memory savings: {estimated_savings_gb:.2f} GB)")
-    
-    return optimizer
-
-
-def create_muon(
-    params: Iterator[nn.Parameter],
-    lr: float,
-    weight_decay: float = 0.01,
-    momentum: float = 0.9,
-    **kwargs
-) -> Optimizer:
-    """
-    创建 Muon 优化器
-    
-    Muon 是一种新兴的优化器，声称在某些深度学习任务上
-    比 Adam 收敛更快、效果更好。它基于不同的优化理论。
-    
-    注意：muon 是一个较新的优化器，API 可能不稳定。
-    当前实现基于公开的 muon 实现。
-    
-    理论背景：
-    - Muon 使用不同的更新规则，强调梯度方向的正交性
-    - 在某些 transformer 训练任务上表现优异
-    
-    Args:
-        params: 模型参数
-        lr: 学习率
-        weight_decay: 权重衰减
-        momentum: 动量系数
-        
-    Returns:
-        Muon: Muon 优化器
-    """
-    if not MUON_AVAILABLE:
-        raise ImportError(
-            "muon is required. "
-            "Install with: pip install muon (or from source)"
-        )
-    
-    print(f"Creating Muon optimizer (lr={lr}, weight_decay={weight_decay})")
-    
-    # 将参数转换为列表
-    param_list = list(params)
-    
-    # 创建优化器
-    optimizer = Muon(
-        param_list,
-        lr=lr,
-        weight_decay=weight_decay,
-        momentum=momentum,
-        **kwargs
-    )
-    
-    print(f"  ✓ Muon optimizer created")
+    print(f"  [OK] 8-bit AdamW created (estimated memory savings: {estimated_savings_gb:.2f} GB)")
     
     return optimizer
 
@@ -271,7 +195,7 @@ def create_standard_adamw(
         **kwargs
     )
     
-    print(f"  ✓ AdamW optimizer created")
+    print("  [OK] AdamW optimizer created")
     
     return optimizer
 

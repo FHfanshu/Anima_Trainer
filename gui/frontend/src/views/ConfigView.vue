@@ -536,33 +536,19 @@
         <!-- 网络设置 -->
         <el-tab-pane label="网络设置" name="network">
           <el-row :gutter="20">
-            <el-col :xs="24" :md="12">
-              <el-form-item label="网络模块">
-                <el-select v-model="configStore.config.network.network_module" style="width: 100%">
-                  <el-option label="LoRA (Kohya)" value="networks.lora" />
-                  <el-option label="LoRA (LyCORIS)" value="lycoris.kohya" />
-                  <el-option label="LoCon (LyCORIS)" value="lycoris.kohya" />
-                  <el-option label="LoHa (LyCORIS)" value="lycoris.kohya" />
+            <el-col :xs="24" :md="8">
+              <el-form-item label="网络类型">
+                <el-select 
+                  v-model="configStore.config.network.network_type" 
+                  style="width: 100%"
+                  @change="onNetworkTypeChange"
+                >
+                  <el-option label="LoRA" value="lora" />
+                  <el-option label="LoKR (LyCORIS)" value="lokr" />
                 </el-select>
               </el-form-item>
             </el-col>
             
-            <el-col :xs="24" :md="12">
-              <el-form-item label="网络权重 (可选)">
-                <el-input
-                  v-model="configStore.config.network.network_weights"
-                  placeholder="从已有 LoRA 继续训练"
-                  clearable
-                >
-                  <template #append>
-                    <el-button @click="browseNetworkWeights">浏览</el-button>
-                  </template>
-                </el-input>
-              </el-form-item>
-            </el-col>
-          </el-row>
-
-          <el-row :gutter="20">
             <el-col :xs="24" :md="8">
               <el-form-item label="网络维度 (Dim)">
                 <el-input-number 
@@ -584,8 +570,24 @@
                 />
               </el-form-item>
             </el-col>
+          </el-row>
+
+          <el-row :gutter="20">
+            <el-col :xs="24" :md="12">
+              <el-form-item label="网络权重 (可选)">
+                <el-input
+                  v-model="configStore.config.network.network_weights"
+                  placeholder="从已有 LoRA/LoKR 继续训练"
+                  clearable
+                >
+                  <template #append>
+                    <el-button @click="browseNetworkWeights">浏览</el-button>
+                  </template>
+                </el-input>
+              </el-form-item>
+            </el-col>
             
-            <el-col :xs="24" :md="8">
+            <el-col :xs="24" :md="12">
               <el-form-item label="网络 Dropout">
                 <el-slider 
                   v-model="configStore.config.network.network_dropout" 
@@ -594,26 +596,6 @@
                   :step="0.01"
                   show-input
                 />
-              </el-form-item>
-            </el-col>
-          </el-row>
-
-          <el-row :gutter="20">
-            <el-col :xs="24" :md="12">
-              <el-form-item>
-                <template #label>
-                  <span>仅训练 Text Encoder</span>
-                </template>
-                <el-switch v-model="configStore.config.network.network_train_text_encoder_only" />
-              </el-form-item>
-            </el-col>
-            
-            <el-col :xs="24" :md="12">
-              <el-form-item>
-                <template #label>
-                  <span>仅训练 UNet</span>
-                </template>
-                <el-switch v-model="configStore.config.network.network_train_unet_only" />
               </el-form-item>
             </el-col>
           </el-row>
@@ -764,39 +746,91 @@ const trainStore = useTrainStore()
 const formRef = ref()
 const activeTab = ref('model')
 
-const browseModel = () => {
-  ElMessage.info('打开模型选择对话框')
+// 网络类型改变时自动更新 network_module
+const onNetworkTypeChange = (type: 'lora' | 'lokr') => {
+  configStore.config.network.network_type = type
+  if (type === 'lora') {
+    configStore.config.network.network_module = 'networks.lora'
+  } else if (type === 'lokr') {
+    configStore.config.network.network_module = 'lycoris.kohya'
+  }
 }
 
-const browseVAE = () => {
-  ElMessage.info('打开 VAE 选择对话框')
+const browseModel = async () => {
+  try {
+    const resp = await api.system.pickFile('model')
+    const path = resp.data?.path
+    if (path) configStore.config.pretrained_model_name_or_path = path
+  } catch {
+    ElMessage.error('打开模型选择对话框失败')
+  }
 }
 
-const browseTrainData = () => {
-  ElMessage.info('打开训练数据选择对话框')
+const browseVAE = async () => {
+  try {
+    const resp = await api.system.pickFile('model')
+    const path = resp.data?.path
+    if (path) configStore.config.vae = path
+  } catch {
+    ElMessage.error('打开 VAE 选择对话框失败')
+  }
 }
 
-const browseRegData = () => {
-  ElMessage.info('打开正则化数据选择对话框')
+const browseTrainData = async () => {
+  try {
+    const resp = await api.system.pickFolder()
+    const path = resp.data?.path
+    if (path) configStore.config.train_data_dir = path
+  } catch {
+    ElMessage.error('打开训练数据选择对话框失败')
+  }
 }
 
-const browseOutput = () => {
-  ElMessage.info('打开输出目录选择对话框')
+const browseRegData = async () => {
+  try {
+    const resp = await api.system.pickFolder()
+    const path = resp.data?.path
+    if (path) configStore.config.reg_data_dir = path
+  } catch {
+    ElMessage.error('打开正则化数据选择对话框失败')
+  }
 }
 
-const browseNetworkWeights = () => {
-  ElMessage.info('打开网络权重选择对话框')
+const browseOutput = async () => {
+  try {
+    const resp = await api.system.pickFolder()
+    const path = resp.data?.path
+    if (path) configStore.config.output_dir = path
+  } catch {
+    ElMessage.error('打开输出目录选择对话框失败')
+  }
 }
 
-const browseLogDir = () => {
-  ElMessage.info('打开日志目录选择对话框')
+const browseNetworkWeights = async () => {
+  try {
+    const resp = await api.system.pickFile('model')
+    const path = resp.data?.path
+    if (path) configStore.config.network.network_weights = path
+  } catch {
+    ElMessage.error('打开网络权重选择对话框失败')
+  }
+}
+
+const browseLogDir = async () => {
+  try {
+    const resp = await api.system.pickFolder()
+    const path = resp.data?.path
+    if (path) configStore.config.logging_dir = path
+  } catch {
+    ElMessage.error('打开日志目录选择对话框失败')
+  }
 }
 
 const saveConfig = async () => {
   try {
-    await api.config.save(configStore.config)
+    await api.config.save({ config: configStore.config })
     configStore.saveConfig()
-    ElMessage.success('配置已保存')
+    ElMessage.success('配置已保存为 TOML')
   } catch (error) {
     ElMessage.error('保存配置失败')
   }

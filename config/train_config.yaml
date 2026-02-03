@@ -40,7 +40,7 @@ gradient_accumulation_steps: 4
 gradient_checkpointing: true
 
 # 优化器配置
-optimizer: "adamw8bit"  # 可选: "adamw8bit", "muon", "adamw"
+optimizer: "adamw8bit"  # 可选: "adamw8bit", "adamw"
 learning_rate: 1.0e-4
 scale_lr: true
 lr_scheduler: "cosine_with_restarts"

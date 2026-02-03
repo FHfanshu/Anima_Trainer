@@ -15,7 +15,6 @@ from .model_utils import (
 from .optimizer_utils import (
     create_optimizer,
     create_8bit_adamw,
-    create_muon,
     create_standard_adamw,
     get_optimizer_info,
 )
@@ -41,7 +40,6 @@ __all__ = [
     # Optimizer Utils
     "create_optimizer",
     "create_8bit_adamw",
-    "create_muon",
     "create_standard_adamw",
     "get_optimizer_info",
     # Checkpoint
