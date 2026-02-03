@@ -40,8 +40,12 @@ models/
 ├── vae/
 │   └── qwen_image_vae.safetensors
 └── text_encoders/
-    └── (Qwen 模型文件)
+    ├── config.json              # 已包含在仓库中
+    ├── tokenizer_config.json    # 已包含在仓库中
+    └── model.safetensors        # 需下载 Qwen3-0.6B 权重
 ```
+
+**注意**: `text_encoders/` 目录需要 Qwen3 模型权重文件 `model.safetensors`，可从 [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B/tree/main) 下载。
 
 ### 2. 准备数据集
 

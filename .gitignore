@@ -36,6 +36,14 @@ Anima_Trainer/
 examples/
 scripts/
 
+# Model weights (keep code/config, ignore large weights)
+*.safetensors
+*.ckpt
+*.bin
+*.npz
+models/text_encoders/tokenizer.json
+models/text_encoders/vocab.json
+
 # Misc
 nul
 =2.14.0
