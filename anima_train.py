@@ -961,9 +961,7 @@ def sample_image(
         latents = latents - dt * v
 
     # VAE 解码
-    mean, inv_std = vae.scale
-    latents = latents / inv_std.view(1, -1, 1, 1, 1) + mean.view(1, -1, 1, 1, 1)
-    images = vae.model.decode(latents)
+    images = vae.model.decode(latents, vae.scale)
     images = images.squeeze(2)  # [B,C,H,W]
     images = (images.clamp(-1, 1) + 1) / 2
 
@@ -1388,6 +1386,12 @@ def main():
         # epoch 结束后的操作
         current_epoch = epoch + 1
         if not args.max_steps or global_step < args.max_steps:
+            # 保存 checkpoint
+            if args.save_every > 0 and current_epoch % args.save_every == 0:
+                save_path = output_dir / f"{args.output_name}_epoch{current_epoch}.safetensors"
+                injector.save(save_path)
+                emit(f"Saved LoRA: {save_path}")
+
             # 采样
             if args.sample_every > 0 and current_epoch % args.sample_every == 0:
                 img = sample_image(
@@ -1396,12 +1400,6 @@ def main():
                 )
                 img.save(sample_dir / f"epoch_{current_epoch}.png")
                 emit(f"采样保存: epoch_{current_epoch}.png")
-
-            # 保存 checkpoint
-            if args.save_every > 0 and current_epoch % args.save_every == 0:
-                save_path = output_dir / f"{args.output_name}_epoch{current_epoch}.safetensors"
-                injector.save(save_path)
-                emit(f"Saved LoRA: {save_path}")
 
         # 检查 max_steps
         if args.max_steps and global_step >= args.max_steps:
