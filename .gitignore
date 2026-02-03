@@ -16,12 +16,6 @@ dist/
 venv/
 ENV/
 
-# GUI (local only)
-gui/
-start_gui.py
-start_gui.bat
-START_GUI_README.md
-
 # Logs / local outputs
 output/
 config/autosave/
@@ -37,6 +31,13 @@ Thumbs.db
 .idea/
 .claude/
 
+# Deleted directories (prevent re-creation)
+Anima_Trainer/
+examples/
+scripts/
+
 # Misc
 nul
 =2.14.0
+AGENTS.md
+CLAUDE.md

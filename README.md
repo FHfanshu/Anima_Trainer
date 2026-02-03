@@ -58,19 +58,8 @@ data/
 
 ### 3. 启动训练
 
-**Linux/macOS:**
 ```bash
-bash scripts/train_example.sh
-```
-
-**Windows:**
-```batch
-scripts\train_example.bat
-```
-
-**直接使用 accelerate:**
-```bash
-accelerate launch train.py \
+accelerate launch anima_train.py \
   --pretrained_model_name_or_path="circlestone-labs/Anima" \
   --data_root="./data/character_dataset" \
   --output_dir="./output/character_lora" \
@@ -89,8 +78,8 @@ accelerate launch train.py \
 
 ```
 Anima_Trainer/
-├── train.py                  # 主训练脚本
-├── requirements.txt          # 依赖列表
+├── anima_train.py           # 主训练脚本
+├── requirements.txt         # 依赖列表
 ├── config/
 │   └── train_config.yaml    # 训练配置示例
 ├── utils/
@@ -99,9 +88,9 @@ Anima_Trainer/
 │   ├── model_utils.py       # 模型加载和 LoRA 配置
 │   ├── optimizer_utils.py   # 优化器创建
 │   └── checkpoint.py        # Checkpoint 管理
-└── scripts/
-    ├── train_example.sh     # Linux/macOS 启动脚本
-    └── train_example.bat    # Windows 启动脚本
+├── gui/                     # Web GUI (半成品)
+├── start_gui.py             # GUI 启动脚本
+└── start_gui.bat            # Windows GUI 启动
 ```
 
 ## 配置详解
@@ -130,7 +119,7 @@ Anima_Trainer/
 ### Resume from Checkpoint
 
 ```bash
-accelerate launch train.py \
+accelerate launch anima_train.py \
   --resume_from_checkpoint="./output/checkpoints/checkpoint-1000" \
   ...
 ```
@@ -196,7 +185,7 @@ brown hair, long hair, smile, school uniform, sitting, ...
 ### 使用配置文件
 
 ```bash
-accelerate launch train.py --config_file=config/train_config.yaml
+accelerate launch train_v2.py --config_file=config/train_config.yaml
 ```
 
 ## License
