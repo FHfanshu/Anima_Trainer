@@ -16,14 +16,17 @@ dist/
 venv/
 ENV/
 
-# Node / Vite
-gui/frontend/node_modules/
-gui/frontend/dist/
+# GUI (local only)
+gui/
+start_gui.py
+start_gui.bat
+START_GUI_README.md
 
 # Logs / local outputs
 output/
 config/autosave/
 *.log
+wandb/
 
 # OS / editor
 .DS_Store
@@ -32,3 +35,8 @@ Thumbs.db
 *.swo
 .vscode/
 .idea/
+.claude/
+
+# Misc
+nul
+=2.14.0
