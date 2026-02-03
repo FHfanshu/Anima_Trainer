@@ -123,4 +123,6 @@ sample_every: 5        # 每 N 个 epoch 采样
 
 ## License
 
-MIT License
+本项目代码采用 MIT License。
+
+**注意**: Anima 模型和 Cosmos 相关代码请遵守其原始协议。
