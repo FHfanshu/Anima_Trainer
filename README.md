@@ -202,3 +202,7 @@ accelerate launch train.py --config_file=config/train_config.yaml
 ## License
 
 MIT License。Anima 模型本身的使用请遵循其官方许可证。
+
+## Contributors
+
+- [Claude Opus 4.5](https://claude.ai) - AI pair programmer
