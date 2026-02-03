@@ -16,15 +16,18 @@
 git clone <repo-url>
 cd Anima_Trainer
 
-# 创建虚拟环境（推荐）
-conda create -n anima-lora python=3.10
-conda activate anima-lora
+# 创建虚拟环境（推荐，Python 3.12）
+# Windows (PowerShell):
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -U pip uv
+
+# Linux/macOS:
+# python3.12 -m venv .venv
+# . .venv/bin/activate
+# python -m pip install -U pip uv
 
 # 安装依赖
-pip install -r requirements.txt
-
-# 安装 Flash Attention 2（可选，但强烈推荐）
-pip install flash-attn --no-build-isolation
+uv pip install -r requirements.txt
 ```
 
 ## 快速开始
@@ -78,8 +81,6 @@ accelerate launch train.py \
   --num_train_epochs=100 \
   --learning_rate=1e-4 \
   --gradient_checkpointing \
-  --enable_flash_attention \
-  --checkpointing_steps=500 \
   --mixed_precision=bf16 \
   --optimizer=adamw8bit
 ```
@@ -116,16 +117,14 @@ Anima_Trainer/
 
 ### 优化器选择
 
-| 优化器 | 命令 | 显存节省 | 适用场景 |
-|--------|------|----------|----------|
-| 8-bit AdamW | `--optimizer=adamw8bit` | ~50% | 显存受限 |
-| Muon | `--optimizer=muon` | 标准 | 实验性 |
-| 标准 AdamW | `--optimizer=adamw` | 标准 | 后备选项 |
+| 优化器 | 命令 | 说明 |
+|--------|------|------|
+| 8-bit AdamW | `--optimizer=adamw8bit` | 推荐，节省显存 |
+| 标准 AdamW | `--optimizer=adamw` | 后备选项 |
 
 ### 内存优化
 
 - **Gradient Checkpointing**: `--gradient_checkpointing` (推荐开启)
-- **Flash Attention 2**: `--enable_flash_attention` (需要 `flash-attn` 库)
 - **8-bit Optimizer**: `--optimizer=adamw8bit`
 
 ### Resume from Checkpoint
@@ -138,9 +137,8 @@ accelerate launch train.py \
 
 ## 硬件要求
 
-- **GPU**: RTX 3090 (24GB) 或更高
+- **GPU**: 24GB+ 显存
 - **内存**: 32GB+ RAM
-- **存储**: 至少 50GB 可用空间
 
 ## 最佳实践
 
@@ -198,60 +196,9 @@ brown hair, long hair, smile, school uniform, sitting, ...
 ### 使用配置文件
 
 ```bash
-# 使用 OmegaConf 加载 YAML 配置
 accelerate launch train.py --config_file=config/train_config.yaml
-```
-
-### 多卡训练
-
-```bash
-accelerate launch --multi_gpu --num_processes=2 train.py ...
-```
-
-### 自定义验证提示词
-
-```bash
---validation_prompt="1girl, sakurako, masterpiece, best quality" \
---validation_epochs=5 \
---num_validation_images=4
-```
-
-## 训练后使用 LoRA
-
-生成的 LoRA 文件可以使用以下方式加载：
-
-### ComfyUI
-将 `lora_weights.safetensors` 放入 `ComfyUI/models/loras/`
-
-### diffusers
-```python
-from diffusers import CosmosPipeline
-import torch
-
-pipe = CosmosPipeline.from_pretrained(
-    "circlestone-labs/Anima",
-    torch_dtype=torch.bfloat16
-).to("cuda")
-
-pipe.load_lora_weights("path/to/lora_weights.safetensors")
-
-image = pipe(
-    prompt="1girl, sakurako, masterpiece, best quality",
-    num_inference_steps=30,
-).images[0]
 ```
 
 ## License
 
-本项目采用 MIT License。Anima 模型本身的使用请遵循其官方许可证。
-
-## 致谢
-
-- [Hugging Face Diffusers](https://github.com/huggingface/diffusers)
-- [Hugging Face PEFT](https://github.com/huggingface/peft)
-- [LyCORIS](https://github.com/KohakuBlueleaf/LyCORIS)
-- [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes)
-
-## 联系方式
-
-如有问题或建议，欢迎提交 Issue 或 PR！
+MIT License。Anima 模型本身的使用请遵循其官方许可证。
