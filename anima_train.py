@@ -690,8 +690,10 @@ class LoRAInjector:
         """导出 LoRA 权重 (ComfyUI 兼容格式)"""
         sd = {}
         for name, lora in self.injected.items():
-            # ComfyUI 格式: lycoris_{key} 其中 key 是模型路径的 . 替换成 _
-            base = "lycoris_" + name.replace(".", "_")
+            # ComfyUI 格式: lycoris_{key} 其中 key 是 diffusion_model.net.xxx 的 net.xxx 部分
+            # 模型内部 name 是 blocks.0.xxx，需要加上 net. 前缀
+            full_name = "net." + name
+            base = "lycoris_" + full_name.replace(".", "_")
             sd[f"{base}.alpha"] = torch.tensor(self.alpha)
 
             if self.use_lokr:
