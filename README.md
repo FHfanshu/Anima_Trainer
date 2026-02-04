@@ -119,10 +119,7 @@ sample_every: 5        # 每 N 个 epoch 采样
 ## 致谢
 
 - 本项目参考了网络上流传的 Anima 训练脚本，原作者不详，如有侵权请联系删除
-- [Claude Opus 4.5](https://claude.ai) - AI 编程助手
-
-## 贡献者
-
+- [Claude Opus 4.5](https://claude.ai)
 - OpenAI Codex (ChatGPT)
 
 ## License
