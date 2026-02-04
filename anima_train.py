@@ -529,6 +529,8 @@ def load_text_encoders(qwen_path, t5_tokenizer_path, device, dtype):
 
     # Qwen
     qwen_tokenizer = AutoTokenizer.from_pretrained(qwen_path, trust_remote_code=True)
+    if qwen_tokenizer.pad_token is None:
+        qwen_tokenizer.pad_token = qwen_tokenizer.eos_token
     qwen_model = AutoModelForCausalLM.from_pretrained(
         qwen_path, torch_dtype=dtype, trust_remote_code=True
     ).to(device).eval().requires_grad_(False)
@@ -693,6 +695,8 @@ class LoRAInjector:
         self.factor = factor
         self.targets = targets or self.DEFAULT_TARGETS
         self.injected = {}
+        # ComfyUI 通用格式使用 diffusion_model. 前缀
+        self.key_prefix = "diffusion_model."
 
     def inject(self, model):
         """注入 LoRA 到模型"""
@@ -736,9 +740,9 @@ class LoRAInjector:
         """导出 LoRA 权重 (ComfyUI 兼容格式)"""
         sd = {}
         for name, lora in self.injected.items():
-            # ComfyUI 格式: lycoris_{key} 其中 key 是 diffusion_model.xxx 的 xxx 部分
-            # ComfyUI 加载时会去掉 checkpoint 的 "net." 前缀，因此这里不加 net.
-            base = "lycoris_" + name.replace(".", "_")
+            # ComfyUI 通用格式: diffusion_model.<module_path>
+            # 例如 diffusion_model.blocks.0.self_attn.q_proj
+            base = f"{self.key_prefix}{name}"
             sd[f"{base}.alpha"] = torch.tensor(self.alpha)
 
             if self.use_lokr:
@@ -751,18 +755,23 @@ class LoRAInjector:
 
     def load_state_dict(self, sd):
         """从 state_dict 加载 LoRA 权重"""
+        def key_bases(name):
+            # 新格式：diffusion_model.<name>
+            # 旧格式：lycoris_<name> / lycoris_net_<name>
+            base_new = f"{self.key_prefix}{name}"
+            base_old = "lycoris_" + name.replace(".", "_")
+            base_legacy = "lycoris_net_" + name.replace(".", "_")
+            return (base_new, base_old, base_legacy)
+
         for name, lora in self.injected.items():
-            base = "lycoris_" + name.replace(".", "_")
-            legacy_base = "lycoris_net_" + name.replace(".", "_")
-            bases = (base, legacy_base)
             if self.use_lokr:
-                for b in bases:
+                for b in key_bases(name):
                     if f"{b}.lokr_w1" in sd:
                         lora.adapter.lokr_w1.data.copy_(sd[f"{b}.lokr_w1"])
                     if f"{b}.lokr_w2" in sd:
                         lora.adapter.lokr_w2.data.copy_(sd[f"{b}.lokr_w2"])
             else:
-                for b in bases:
+                for b in key_bases(name):
                     if f"{b}.lora_down.weight" in sd:
                         lora.adapter.lora_down.weight.data.copy_(sd[f"{b}.lora_down.weight"])
                     if f"{b}.lora_up.weight" in sd:
