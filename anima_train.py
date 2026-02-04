@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import types
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -142,6 +143,8 @@ def apply_yaml_config(args, config):
         "output_dir": "output_dir",
         "output_name": "output_name",
         "save_every": "save_every",
+        "save_state": "save_state",
+        "resume": "resume",
         "seed": "seed",
         # 采样
         "sample_every": "sample_every",
@@ -181,6 +184,8 @@ def apply_yaml_config(args, config):
         "output_dir": "./output",
         "output_name": "anima_lora",
         "save_every": 0,
+        "save_state": 0,
+        "resume": "",
         "seed": 42,
         "sample_every": 0,
         "sample_prompt": "1girl, masterpiece",
@@ -404,11 +409,15 @@ def load_anima_model(transformer_path, device, dtype, repo_root):
     Anima = anima_modeling.Anima
 
     # 从 checkpoint 推断配置
+    w = None
     with safe_open(transformer_path, framework="pt", device="cpu") as f:
         for k in f.keys():
             if k.endswith("x_embedder.proj.1.weight"):
                 w = f.get_tensor(k)
                 break
+
+    if w is None:
+        raise RuntimeError("无法在 transformer 权重中找到 x_embedder.proj.1.weight")
 
     in_channels = (w.shape[1] // 4) - 1  # concat_padding_mask=True
     model_channels = w.shape[0]
@@ -511,7 +520,18 @@ def load_text_encoders(qwen_path, t5_tokenizer_path, device, dtype):
     if t5_tokenizer_path and Path(t5_tokenizer_path).exists():
         t5_tokenizer = T5Tokenizer.from_pretrained(t5_tokenizer_path)
     else:
-        t5_tokenizer = T5Tokenizer.from_pretrained("google/t5-v1_1-xxl")
+        class _DummyT5Tokenizer:
+            def __call__(self, texts, max_length=512, **_kwargs):
+                if isinstance(texts, str):
+                    batch = 1
+                else:
+                    batch = len(texts)
+                input_ids = torch.zeros((batch, max_length), dtype=torch.long)
+                attention_mask = torch.zeros((batch, max_length), dtype=torch.long)
+                return types.SimpleNamespace(input_ids=input_ids, attention_mask=attention_mask)
+
+        t5_tokenizer = _DummyT5Tokenizer()
+        logger.warning("未提供 T5 tokenizer，使用占位 tokenizer（不会下载）")
 
     logger.info("文本编码器加载完成")
     return qwen_model, qwen_tokenizer, t5_tokenizer
@@ -674,8 +694,15 @@ class LoRAInjector:
             parts = name.split(".")
             parent = model
             for p in parts[:-1]:
-                parent = getattr(parent, p)
-            setattr(parent, parts[-1], lora_linear)
+                if p.isdigit():
+                    parent = parent[int(p)]
+                else:
+                    parent = getattr(parent, p)
+            last = parts[-1]
+            if last.isdigit():
+                parent[int(last)] = lora_linear
+            else:
+                setattr(parent, last, lora_linear)
             self.injected[name] = lora_linear
 
         logger.info(f"注入 {'LoKr' if self.use_lokr else 'LoRA'} 到 {len(self.injected)} 层")
@@ -706,6 +733,22 @@ class LoRAInjector:
                 sd[f"{base}.lora_up.weight"] = lora.adapter.lora_up.weight.data.clone()
         return sd
 
+    def load_state_dict(self, sd):
+        """从 state_dict 加载 LoRA 权重"""
+        for name, lora in self.injected.items():
+            full_name = "net." + name
+            base = "lycoris_" + full_name.replace(".", "_")
+            if self.use_lokr:
+                if f"{base}.lokr_w1" in sd:
+                    lora.adapter.lokr_w1.data.copy_(sd[f"{base}.lokr_w1"])
+                if f"{base}.lokr_w2" in sd:
+                    lora.adapter.lokr_w2.data.copy_(sd[f"{base}.lokr_w2"])
+            else:
+                if f"{base}.lora_down.weight" in sd:
+                    lora.adapter.lora_down.weight.data.copy_(sd[f"{base}.lora_down.weight"])
+                if f"{base}.lora_up.weight" in sd:
+                    lora.adapter.lora_up.weight.data.copy_(sd[f"{base}.lora_up.weight"])
+
     def save(self, path):
         """保存为 safetensors (ComfyUI 兼容)"""
         from safetensors.torch import save_file
@@ -718,6 +761,63 @@ class LoRAInjector:
         }
         save_file(sd, path, metadata=meta)
         logger.info(f"LoRA 保存到: {path}")
+
+
+def save_training_state(state_dir, injector, optimizer, epoch, global_step, keep_last_n=1):
+    """保存训练状态用于恢复"""
+    import shutil
+    state_dir = Path(state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    # 保存当前状态
+    epoch_dir = state_dir / f"epoch-{epoch}"
+    epoch_dir.mkdir(exist_ok=True)
+
+    # 保存 LoRA 权重
+    injector.save(epoch_dir / "lora.safetensors")
+
+    # 保存 optimizer 和训练信息
+    torch.save({
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+        "global_step": global_step,
+    }, epoch_dir / "state.pt")
+
+    logger.info(f"训练状态保存到: {epoch_dir}")
+
+    # 清理旧状态，只保留最近 N 个
+    if keep_last_n > 0:
+        existing = sorted(state_dir.glob("epoch-*"), key=lambda p: int(p.name.split("-")[1]))
+        while len(existing) > keep_last_n:
+            old_dir = existing.pop(0)
+            shutil.rmtree(old_dir)
+            logger.info(f"删除旧状态: {old_dir}")
+
+
+def load_training_state(state_dir, injector, optimizer):
+    """加载训练状态"""
+    state_dir = Path(state_dir)
+
+    # 加载 LoRA 权重
+    lora_path = state_dir / "lora.safetensors"
+    if lora_path.exists():
+        from safetensors import safe_open
+        with safe_open(lora_path, framework="pt") as f:
+            sd = {k: f.get_tensor(k) for k in f.keys()}
+        injector.load_state_dict(sd)
+        logger.info(f"LoRA 权重已加载: {lora_path}")
+
+    # 加载 optimizer 和训练信息
+    state_path = state_dir / "state.pt"
+    if state_path.exists():
+        state = torch.load(state_path, weights_only=False)
+        optimizer.load_state_dict(state["optimizer"])
+        epoch = state["epoch"]
+        global_step = state["global_step"]
+        logger.info(f"训练状态已加载: epoch={epoch}, step={global_step}")
+        return epoch, global_step
+
+    return 0, 0
 
 
 # ============================================================================
@@ -939,6 +1039,7 @@ def sample_image(
     prompt, height=1024, width=1024, steps=30, device="cuda", dtype=torch.bfloat16
 ):
     """Flow Matching 采样生成图像"""
+    was_training = model.training
     model.eval()
 
     # 文本编码
@@ -960,7 +1061,8 @@ def sample_image(
         t = torch.tensor([[1.0 - i * dt]], device=device, dtype=dtype)
         pad_mask = torch.zeros(1, 1, lat_h, lat_w, device=device, dtype=dtype)
 
-        with torch.autocast("cuda", dtype=dtype):
+        autocast_ctx = torch.autocast("cuda", dtype=dtype) if device == "cuda" else nullcontext()
+        with autocast_ctx:
             v = model(latents, t, cross, padding_mask=pad_mask)
         latents = latents - dt * v
 
@@ -973,7 +1075,8 @@ def sample_image(
     img = images[0].permute(1, 2, 0).cpu().float().numpy()
     img = (img * 255).clip(0, 255).astype(np.uint8)
 
-    model.train()
+    if was_training:
+        model.train()
     return Image.fromarray(img)
 
 
@@ -1019,6 +1122,7 @@ def parse_args():
     p.add_argument("--t5-tokenizer", default="", help="T5 tokenizer 目录")
     p.add_argument("--output-dir", default="./output", help="输出目录")
     p.add_argument("--output-name", default="anima_lora", help="输出名称")
+    p.add_argument("--lora-name", default="", help="输出子目录名 (可选)")
 
     # 训练参数
     p.add_argument("--epochs", type=int, default=10)
@@ -1026,7 +1130,7 @@ def parse_args():
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--resolution", type=int, default=1024)
-    p.add_argument("--mixed-precision", choices=["fp32", "bf16"], default="bf16")
+    p.add_argument("--mixed-precision", choices=["fp32", "bf16", "fp16"], default="bf16")
     p.add_argument("--grad-checkpoint", action="store_true", help="启用梯度检查点减少显存")
     p.add_argument("--xformers", action="store_true", help="启用 xformers memory efficient attention")
     p.add_argument("--max-steps", type=int, default=0, help="最大训练步数 (0=无限制)")
@@ -1051,6 +1155,8 @@ def parse_args():
 
     # 保存参数
     p.add_argument("--save-every", type=int, default=0, help="每 N 个 epoch 保存 (0=仅结束时)")
+    p.add_argument("--save-state", type=int, default=0, help="保存最近 N 个 epoch 的训练状态 (0=不保存)")
+    p.add_argument("--resume", type=str, default="", help="从指定状态目录恢复训练")
     p.add_argument("--seed", type=int, default=42)
 
     # 进度显示
@@ -1147,8 +1253,8 @@ def prompt_for_args(args):
     args.lora_alpha = _ask_float("LoRA alpha", args.lora_alpha)
     args.loss_curve_steps = _ask_int("Loss 曲线步数 (0=禁用)", args.loss_curve_steps)
     args.auto_install = _ask_bool("自动安装缺失依赖?", args.auto_install)
-    args.save_every_epoch = _ask_bool("每个 epoch 保存?", args.save_every_epoch)
-    args.mixed_precision = _ask_str("混合精度 (bf16/fp32)", args.mixed_precision)
+    args.save_every = _ask_int("每隔多少 epoch 保存 (0=禁用)", args.save_every)
+    args.mixed_precision = _ask_str("混合精度 (bf16/fp16/fp32)", args.mixed_precision)
     return args
 
 
@@ -1183,11 +1289,16 @@ def main():
     np.random.seed(args.seed)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32
+    if args.mixed_precision == "bf16":
+        dtype = torch.bfloat16
+    elif args.mixed_precision == "fp16":
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
 
     # 创建输出目录
     if args.lora_name:
-        output_dir = Path("output") / args.lora_name
+        output_dir = Path(args.output_dir) / args.lora_name
     else:
         output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1252,9 +1363,44 @@ def main():
         num_workers=args.num_workers
     )
 
-    # 优化器
+    # 优化器 (8-bit AdamW)
     params = injector.get_params()
-    optimizer = torch.optim.AdamW(params, lr=args.lr)
+    try:
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.AdamW8bit(params, lr=args.lr)
+        logger.info("使用 8-bit AdamW 优化器")
+    except ImportError:
+        optimizer = torch.optim.AdamW(params, lr=args.lr)
+        logger.warning("bitsandbytes 未安装，使用标准 AdamW")
+
+    # 恢复训练状态
+    start_epoch = 0
+    global_step = 0
+    if args.resume:
+        resume_dir = Path(args.resume)
+        resolved_resume = None
+        if resume_dir.exists():
+            if (resume_dir / "state.pt").exists() or (resume_dir / "lora.safetensors").exists():
+                resolved_resume = resume_dir
+            else:
+                candidates = []
+                for p in resume_dir.glob("epoch-*"):
+                    if not p.is_dir():
+                        continue
+                    try:
+                        epoch_num = int(p.name.split("-", 1)[1])
+                    except Exception:
+                        continue
+                    candidates.append((epoch_num, p))
+                if candidates:
+                    candidates.sort(key=lambda x: x[0])
+                    resolved_resume = candidates[-1][1]
+        if resolved_resume:
+            start_epoch, global_step = load_training_state(resolved_resume, injector, optimizer)
+            start_epoch += 1  # 从下一个 epoch 开始
+            logger.info(f"从 epoch {start_epoch} 恢复训练: {resolved_resume}")
+        else:
+            logger.warning(f"Resume 目录无有效状态: {resume_dir}")
 
     # 计算总步数
     try:
@@ -1304,12 +1450,13 @@ def main():
             print(msg)
 
     # 训练循环
-    global_step = 0
     model.train()
     step_start_time = time.perf_counter()
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
+        had_batches = False
         for batch_idx, batch in enumerate(dataloader):
+            had_batches = True
             # 在累积周期开始时记录时间
             if batch_idx % args.grad_accum == 0:
                 step_start_time = time.perf_counter()
@@ -1344,7 +1491,8 @@ def main():
 
             # 前向
             pad_mask = torch.zeros(bs, 1, latents.shape[-2], latents.shape[-1], device=device, dtype=dtype)
-            with torch.autocast("cuda", dtype=dtype):
+            autocast_ctx = torch.autocast("cuda", dtype=dtype) if device == "cuda" else nullcontext()
+            with autocast_ctx:
                 pred = forward_with_optional_checkpoint(
                     model, noisy, t.view(-1, 1), cross, pad_mask,
                     use_checkpoint=args.grad_checkpoint
@@ -1390,6 +1538,13 @@ def main():
                 if args.max_steps and global_step >= args.max_steps:
                     break
 
+        # 处理未对齐的梯度累积
+        if had_batches and (batch_idx + 1) % args.grad_accum != 0:
+            if not args.max_steps or global_step < args.max_steps:
+                optimizer.step()
+                optimizer.zero_grad()
+                global_step += 1
+
         # epoch 结束后的操作
         current_epoch = epoch + 1
         if not args.max_steps or global_step < args.max_steps:
@@ -1403,6 +1558,11 @@ def main():
                 save_path = output_dir / save_name
                 injector.save(save_path)
                 emit(f"Saved LoRA: {save_path}")
+
+            # 保存训练状态
+            if args.save_state > 0:
+                state_dir = output_dir / "state"
+                save_training_state(state_dir, injector, optimizer, current_epoch, global_step, keep_last_n=args.save_state)
 
             # 采样
             if args.sample_every > 0 and current_epoch % args.sample_every == 0:

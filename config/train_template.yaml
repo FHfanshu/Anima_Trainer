@@ -48,6 +48,8 @@ num_workers: 0
 output_dir: "./output"
 output_name: "anima_lora"
 save_every: 0          # 每 N 个 epoch 保存 (0=仅结束时)
+save_state: 0          # 保存最近 N 个 epoch 的训练状态 (0=不保存)
+resume: ""             # 从指定状态目录恢复训练
 seed: 42
 
 # ============================================================================
