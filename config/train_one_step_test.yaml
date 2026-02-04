@@ -1,0 +1,65 @@
+# 一步训练冒烟测试配置
+# 用法: python anima_train.py --config ./config/train_one_step_test.yaml
+
+# ============================================================================
+# 模型路径（相对或绝对路径）
+# ============================================================================
+transformer_path: "models/transformers/anima-preview.safetensors"
+vae_path: "models/vae/qwen_image_vae.safetensors"
+text_encoder_path: "models/text_encoders"
+t5_tokenizer_path: null  # 不下载，使用占位 tokenizer
+
+# ============================================================================
+# 数据集
+# ============================================================================
+data_dir: "E:/lora-scripts-v1.10.0/train/lance/10_lance"
+resolution: 1024
+repeats: 1
+shuffle_caption: false
+keep_tokens: 0
+flip_augment: false
+cache_latents: false
+
+# ============================================================================
+# LoRA 配置
+# ============================================================================
+lora_name: "one_step_test"
+lora_type: "lokr"
+lora_rank: 32
+lora_alpha: 32.0
+lokr_factor: 8
+
+# ============================================================================
+# 训练参数
+# ============================================================================
+epochs: 1
+max_steps: 1
+batch_size: 1
+grad_accum: 1
+learning_rate: 1.0e-4
+mixed_precision: "bf16"
+grad_checkpoint: false
+xformers: true
+num_workers: 0
+
+# ============================================================================
+# 输出与保存
+# ============================================================================
+output_dir: "./output"
+output_name: "anima_lora"
+save_every: 0
+save_state: 0
+resume: ""
+seed: 42
+
+# ============================================================================
+# 采样
+# ============================================================================
+sample_every: 0
+sample_prompt: "1girl, masterpiece"
+
+# ============================================================================
+# 进度显示
+# ============================================================================
+loss_curve_steps: 10
+no_progress: false

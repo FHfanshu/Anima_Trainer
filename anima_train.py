@@ -335,9 +335,16 @@ def enable_xformers(model):
         logger.warning("xformers 未安装，跳过启用")
         return False
 
+    # anima_modeling_core 专用开关
+    setter = getattr(model, "_xformers_setter", None)
+    if callable(setter):
+        if setter(True):
+            logger.info("xformers 已启用: anima_modeling_core")
+            return True
+        logger.warning("xformers 已安装，但 anima_modeling_core 未启用")
+
     enabled_count = 0
-    for name, module in model.named_modules():
-        # 查找 attention 模块并替换
+    for _name, module in model.named_modules():
         if hasattr(module, "set_use_memory_efficient_attention_xformers"):
             module.set_use_memory_efficient_attention_xformers(True)
             enabled_count += 1
@@ -349,9 +356,8 @@ def enable_xformers(model):
         logger.info(f"xformers 已启用: {enabled_count} 个模块")
         return True
 
-    # 如果模型没有内置支持，尝试 monkey patch
-    logger.info("xformers 已加载，将在 attention 计算中使用")
-    return True
+    logger.warning("模型未检测到 xformers 支持，注意该模型可能不会加速")
+    return False
 
 
 # ============================================================================
@@ -391,22 +397,31 @@ def ensure_models_namespace(repo_root):
         sys.path.insert(0, str(repo_root.parent))
 
 
-def load_anima_model(transformer_path, device, dtype, repo_root):
+def load_anima_model(transformer_path, device, dtype, repo_root, prefer_core=False):
     """加载 Anima transformer 模型"""
     from safetensors import safe_open
 
     ensure_models_namespace(repo_root)
 
-    # 加载模型类
-    cosmos_modeling = load_module_from_path(
-        "cosmos_predict2_modeling",
-        repo_root / "cosmos_predict2_modeling.py",
-    )
-    anima_modeling = load_module_from_path(
-        "anima_modeling",
-        repo_root / "anima_modeling.py",
-    )
+    # 优先使用内置核心版本（含 xformers 支持）
+    anima_core_path = repo_root / "anima_modeling_core.py"
+    if prefer_core and anima_core_path.exists():
+        anima_modeling = load_module_from_path(
+            "anima_modeling_core",
+            anima_core_path,
+        )
+        logger.info("使用 anima_modeling_core.py")
+    else:
+        load_module_from_path(
+            "cosmos_predict2_modeling",
+            repo_root / "cosmos_predict2_modeling.py",
+        )
+        anima_modeling = load_module_from_path(
+            "anima_modeling",
+            repo_root / "anima_modeling.py",
+        )
     Anima = anima_modeling.Anima
+    xformers_setter = getattr(anima_modeling, "set_xformers_enabled", None)
 
     # 从 checkpoint 推断配置
     w = None
@@ -446,6 +461,8 @@ def load_anima_model(transformer_path, device, dtype, repo_root):
     )
 
     model = Anima(**config)
+    if callable(xformers_setter):
+        model._xformers_setter = xformers_setter
 
     # 加载权重
     sd = {}
@@ -719,10 +736,9 @@ class LoRAInjector:
         """导出 LoRA 权重 (ComfyUI 兼容格式)"""
         sd = {}
         for name, lora in self.injected.items():
-            # ComfyUI 格式: lycoris_{key} 其中 key 是 diffusion_model.net.xxx 的 net.xxx 部分
-            # 模型内部 name 是 blocks.0.xxx，需要加上 net. 前缀
-            full_name = "net." + name
-            base = "lycoris_" + full_name.replace(".", "_")
+            # ComfyUI 格式: lycoris_{key} 其中 key 是 diffusion_model.xxx 的 xxx 部分
+            # ComfyUI 加载时会去掉 checkpoint 的 "net." 前缀，因此这里不加 net.
+            base = "lycoris_" + name.replace(".", "_")
             sd[f"{base}.alpha"] = torch.tensor(self.alpha)
 
             if self.use_lokr:
@@ -736,18 +752,21 @@ class LoRAInjector:
     def load_state_dict(self, sd):
         """从 state_dict 加载 LoRA 权重"""
         for name, lora in self.injected.items():
-            full_name = "net." + name
-            base = "lycoris_" + full_name.replace(".", "_")
+            base = "lycoris_" + name.replace(".", "_")
+            legacy_base = "lycoris_net_" + name.replace(".", "_")
+            bases = (base, legacy_base)
             if self.use_lokr:
-                if f"{base}.lokr_w1" in sd:
-                    lora.adapter.lokr_w1.data.copy_(sd[f"{base}.lokr_w1"])
-                if f"{base}.lokr_w2" in sd:
-                    lora.adapter.lokr_w2.data.copy_(sd[f"{base}.lokr_w2"])
+                for b in bases:
+                    if f"{b}.lokr_w1" in sd:
+                        lora.adapter.lokr_w1.data.copy_(sd[f"{b}.lokr_w1"])
+                    if f"{b}.lokr_w2" in sd:
+                        lora.adapter.lokr_w2.data.copy_(sd[f"{b}.lokr_w2"])
             else:
-                if f"{base}.lora_down.weight" in sd:
-                    lora.adapter.lora_down.weight.data.copy_(sd[f"{base}.lora_down.weight"])
-                if f"{base}.lora_up.weight" in sd:
-                    lora.adapter.lora_up.weight.data.copy_(sd[f"{base}.lora_up.weight"])
+                for b in bases:
+                    if f"{b}.lora_down.weight" in sd:
+                        lora.adapter.lora_down.weight.data.copy_(sd[f"{b}.lora_down.weight"])
+                    if f"{b}.lora_up.weight" in sd:
+                        lora.adapter.lora_up.weight.data.copy_(sd[f"{b}.lora_up.weight"])
 
     def save(self, path):
         """保存为 safetensors (ComfyUI 兼容)"""
@@ -1311,7 +1330,7 @@ def main():
 
     # 加载模型
     logger.info("加载 Transformer...")
-    model = load_anima_model(args.transformer, device, dtype, repo_root)
+    model = load_anima_model(args.transformer, device, dtype, repo_root, prefer_core=args.xformers)
 
     # 启用 xformers
     if args.xformers:
