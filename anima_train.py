@@ -138,6 +138,7 @@ def apply_yaml_config(args, config):
         "xformers": "xformers",
         "num_workers": "num_workers",
         # 输出与保存
+        "lora_name": "lora_name",
         "output_dir": "output_dir",
         "output_name": "output_name",
         "save_every": "save_every",
@@ -176,6 +177,7 @@ def apply_yaml_config(args, config):
         "grad_checkpoint": False,
         "xformers": False,
         "num_workers": 0,
+        "lora_name": "",
         "output_dir": "./output",
         "output_name": "anima_lora",
         "save_every": 0,
@@ -1184,7 +1186,10 @@ def main():
     dtype = torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32
 
     # 创建输出目录
-    output_dir = Path(args.output_dir)
+    if args.lora_name:
+        output_dir = Path("output") / args.lora_name
+    else:
+        output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     sample_dir = output_dir / "samples"
     sample_dir.mkdir(exist_ok=True)
@@ -1390,7 +1395,12 @@ def main():
         if not args.max_steps or global_step < args.max_steps:
             # 保存 checkpoint
             if args.save_every > 0 and current_epoch % args.save_every == 0:
-                save_path = output_dir / f"{args.output_name}_epoch{current_epoch}.safetensors"
+                if args.lora_name:
+                    lora_type_suffix = "LoKr" if args.lora_type == "lokr" else "LoRA"
+                    save_name = f"{args.lora_name}_Anima_{lora_type_suffix}-ep{current_epoch}.safetensors"
+                else:
+                    save_name = f"{args.output_name}_epoch{current_epoch}.safetensors"
+                save_path = output_dir / save_name
                 injector.save(save_path)
                 emit(f"Saved LoRA: {save_path}")
 
@@ -1408,7 +1418,12 @@ def main():
             break
 
     # 最终保存
-    final_path = output_dir / f"{args.output_name}.safetensors"
+    if args.lora_name:
+        lora_type_suffix = "LoKr" if args.lora_type == "lokr" else "LoRA"
+        final_name = f"{args.lora_name}_Anima_{lora_type_suffix}.safetensors"
+    else:
+        final_name = f"{args.output_name}.safetensors"
+    final_path = output_dir / final_name
     injector.save(final_path)
 
     # 清理进度显示
