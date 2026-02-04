@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # 依赖检测
 # ============================================================================
 
-def ensure_dependencies(auto_install=False):
+def ensure_dependencies(auto_install=False, extra_requirements=None):
     """检测并可选自动安装缺失依赖"""
     required = {
         "numpy": "numpy",
@@ -48,6 +48,8 @@ def ensure_dependencies(auto_install=False):
         "torchvision": "torchvision",
         "yaml": "pyyaml",
     }
+    if extra_requirements:
+        required.update(extra_requirements)
     missing = []
     for module_name, pip_name in required.items():
         try:
@@ -614,7 +616,7 @@ class LoRALayer(torch.nn.Module):
 
 
 class LoKrLayer(torch.nn.Module):
-    """LyCORIS LoKr 层 (ComfyUI 兼容)"""
+    """LyCORIS LoKr 层 (ComfyUI 兼容) - 使用低秩分解"""
     def __init__(self, in_features, out_features, rank=4, alpha=1.0, factor=8, dropout=0.0):
         super().__init__()
         self.rank = rank
@@ -628,14 +630,17 @@ class LoKrLayer(torch.nn.Module):
         self.in_dim = in_features // factor
         self.out_dim = out_features // factor
 
-        # LoKr 分解: W = kron(w1, w2)
-        # w1: [factor, factor], w2: [out_dim, in_dim]
+        # LoKr 分解: W = kron(w1, w2_a @ w2_b)
+        # w1: [factor, factor] - 不使用低秩分解
+        # w2: 使用低秩分解 w2_a @ w2_b
         self.lokr_w1 = torch.nn.Parameter(torch.empty(factor, factor))
-        self.lokr_w2 = torch.nn.Parameter(torch.empty(self.out_dim, self.in_dim))
+        self.lokr_w2_a = torch.nn.Parameter(torch.empty(self.out_dim, rank))
+        self.lokr_w2_b = torch.nn.Parameter(torch.empty(rank, self.in_dim))
         self.dropout = torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity()
 
         torch.nn.init.kaiming_uniform_(self.lokr_w1, a=5**0.5)
-        torch.nn.init.zeros_(self.lokr_w2)
+        torch.nn.init.kaiming_uniform_(self.lokr_w2_a, a=5**0.5)
+        torch.nn.init.zeros_(self.lokr_w2_b)
 
     def _find_factor(self, in_f, out_f, target_factor):
         """找到能同时整除 in_features 和 out_features 的 factor"""
@@ -645,7 +650,10 @@ class LoKrLayer(torch.nn.Module):
         return 1
 
     def forward(self, x):
-        weight = torch.kron(self.lokr_w1, self.lokr_w2)
+        # 先计算 w2 的低秩分解: w2 = w2_a @ w2_b
+        w2 = self.lokr_w2_a @ self.lokr_w2_b
+        # 然后计算 Kronecker 积: W = w1 ⊗ w2
+        weight = torch.kron(self.lokr_w1, w2)
         return F.linear(self.dropout(x), weight) * self.scaling
 
 
@@ -746,8 +754,10 @@ class LoRAInjector:
             sd[f"{base}.alpha"] = torch.tensor(self.alpha)
 
             if self.use_lokr:
+                # 保存 LoKr 的三个权重矩阵
                 sd[f"{base}.lokr_w1"] = lora.adapter.lokr_w1.data.clone()
-                sd[f"{base}.lokr_w2"] = lora.adapter.lokr_w2.data.clone()
+                sd[f"{base}.lokr_w2_a"] = lora.adapter.lokr_w2_a.data.clone()
+                sd[f"{base}.lokr_w2_b"] = lora.adapter.lokr_w2_b.data.clone()
             else:
                 sd[f"{base}.lora_down.weight"] = lora.adapter.lora_down.weight.data.clone()
                 sd[f"{base}.lora_up.weight"] = lora.adapter.lora_up.weight.data.clone()
@@ -768,8 +778,13 @@ class LoRAInjector:
                 for b in key_bases(name):
                     if f"{b}.lokr_w1" in sd:
                         lora.adapter.lokr_w1.data.copy_(sd[f"{b}.lokr_w1"])
-                    if f"{b}.lokr_w2" in sd:
-                        lora.adapter.lokr_w2.data.copy_(sd[f"{b}.lokr_w2"])
+                    if f"{b}.lokr_w2_a" in sd:
+                        lora.adapter.lokr_w2_a.data.copy_(sd[f"{b}.lokr_w2_a"])
+                    if f"{b}.lokr_w2_b" in sd:
+                        lora.adapter.lokr_w2_b.data.copy_(sd[f"{b}.lokr_w2_b"])
+                    # 兼容旧格式（没有分解的 lokr_w2）
+                    elif f"{b}.lokr_w2" in sd:
+                        logger.warning(f"检测到旧格式 LoKr 权重: {b}.lokr_w2，跳过加载")
             else:
                 for b in key_bases(name):
                     if f"{b}.lora_down.weight" in sd:
@@ -789,6 +804,163 @@ class LoRAInjector:
         }
         save_file(sd, path, metadata=meta)
         logger.info(f"LoRA 保存到: {path}")
+
+
+def _import_lycoris():
+    try:
+        from lycoris.wrapper import create_lycoris, LycorisNetwork
+        return create_lycoris, LycorisNetwork
+    except Exception as exc:
+        raise ImportError(
+            "LyCORIS is not installed. Please install with: pip install lycoris-lora"
+        ) from exc
+
+
+class LycorisInjector:
+    """LyCORIS LoKr 注入器（标准实现 + ComfyUI 兼容输出）"""
+    DEFAULT_TARGETS = LoRAInjector.DEFAULT_TARGETS
+
+    def __init__(
+        self,
+        rank=32,
+        alpha=16.0,
+        dropout=0.0,
+        factor=8,
+        targets=None,
+        preset="attn-mlp",
+    ):
+        self.rank = rank
+        self.alpha = alpha
+        self.dropout = dropout
+        self.factor = factor
+        self.targets = targets
+        self.preset = preset
+        self.key_prefix = "diffusion_model."
+        self.network = None
+        self.lora_name_map = {}
+
+    def _apply_target_preset(self, LycorisNetwork):
+        if not self.targets:
+            return
+        patterns = [f"*{t}*" for t in self.targets]
+        preset = {
+            "enable_conv": True,
+            "target_module": [],
+            "target_name": patterns,
+            "use_fnmatch": True,
+            "lora_prefix": "lycoris",
+        }
+        LycorisNetwork.apply_preset(preset)
+
+    def _build_name_map(self, model):
+        name_by_id = {id(module): name for name, module in model.named_modules()}
+        lora_name_map = {}
+        for lora in self.network.loras:
+            org = lora.org_module[0] if getattr(lora, "org_module", None) else None
+            if org is None:
+                continue
+            name = name_by_id.get(id(org))
+            if name:
+                lora_name_map[lora.lora_name] = name
+        self.lora_name_map = lora_name_map
+        if not self.lora_name_map:
+            logger.warning("LyCORIS 未能映射模块名称，ComfyUI 兼容键可能不完整。")
+
+    def inject(self, model):
+        create_lycoris, LycorisNetwork = _import_lycoris()
+        self._apply_target_preset(LycorisNetwork)
+        self.network = create_lycoris(
+            module=model,
+            multiplier=1.0,
+            linear_dim=self.rank,
+            linear_alpha=self.alpha,
+            algo="lokr",
+            dropout=self.dropout,
+            factor=self.factor,
+            preset=self.preset,
+            warn_on_unmatched=True,
+        )
+        self.network.apply_to()
+        try:
+            param = next(model.parameters())
+            self.network.to(device=param.device, dtype=param.dtype)
+            for lora in getattr(self.network, "loras", []):
+                lora.to(device=param.device, dtype=param.dtype)
+        except StopIteration:
+            pass
+        self._build_name_map(model)
+        logger.info(f"LyCORIS LoKr 注入完成: {len(self.network.loras)} 层")
+        return self.network
+
+    def get_params(self):
+        if self.network is None:
+            return []
+        return list(self.network.get_trainable_params())
+
+    def _to_comfy_state_dict(self, sd):
+        if not self.lora_name_map:
+            return sd
+        out = {}
+        for key, value in sd.items():
+            if "." not in key:
+                out[key] = value
+                continue
+            prefix, rest = key.split(".", 1)
+            module_name = self.lora_name_map.get(prefix)
+            if module_name:
+                out[f"{self.key_prefix}{module_name}.{rest}"] = value
+            else:
+                out[key] = value
+        return out
+
+    def _from_comfy_state_dict(self, sd):
+        if not self.lora_name_map:
+            return sd
+        module_to_lora = {name: lora for lora, name in self.lora_name_map.items()}
+        out = {}
+        for key, value in sd.items():
+            if not key.startswith(self.key_prefix):
+                out[key] = value
+                continue
+            rest = key[len(self.key_prefix):]
+            if "." not in rest:
+                out[key] = value
+                continue
+            module_name, suffix = rest.rsplit(".", 1)
+            lora_name = module_to_lora.get(module_name)
+            if lora_name:
+                out[f"{lora_name}.{suffix}"] = value
+            else:
+                out[key] = value
+        return out
+
+    def state_dict(self):
+        if self.network is None:
+            return {}
+        sd = self.network.state_dict()
+        sd = {k: v.detach().cpu() for k, v in sd.items()}
+        return self._to_comfy_state_dict(sd)
+
+    def load_state_dict(self, sd):
+        if self.network is None:
+            return
+        if any(k.startswith(self.key_prefix) for k in sd.keys()):
+            sd = self._from_comfy_state_dict(sd)
+        missing, unexpected = self.network.load_state_dict(sd, strict=False)
+        if missing or unexpected:
+            logger.info(f"LyCORIS 权重加载: missing={len(missing)}, unexpected={len(unexpected)}")
+
+    def save(self, path):
+        from safetensors.torch import save_file
+        sd = self.state_dict()
+        meta = {
+            "ss_network_dim": str(self.rank),
+            "ss_network_alpha": str(self.alpha),
+            "ss_network_module": "lycoris.kohya",
+            "ss_network_args": f'{{"algo": "lokr", "factor": {self.factor}}}',
+        }
+        save_file(sd, path, metadata=meta)
+        logger.info(f"LoKr 保存到: {path}")
 
 
 def save_training_state(state_dir, injector, optimizer, epoch, global_step, keep_last_n=1):
@@ -1305,7 +1477,8 @@ def main():
         args = prompt_for_args(args)
 
     # 依赖检测
-    ensure_dependencies(auto_install=args.auto_install)
+    extra = {"lycoris": "lycoris-lora"} if args.lora_type == "lokr" else None
+    ensure_dependencies(auto_install=args.auto_install, extra_requirements=extra)
 
     # 延迟导入
     import numpy as np
@@ -1353,14 +1526,21 @@ def main():
         args.qwen, args.t5_tokenizer, device, dtype
     )
 
-    # 注入 LoRA
+    # 注入 LoRA / LoKr
     logger.info(f"注入 {args.lora_type.upper()}...")
-    injector = LoRAInjector(
-        rank=args.lora_rank,
-        alpha=args.lora_alpha,
-        use_lokr=(args.lora_type == "lokr"),
-        factor=args.lokr_factor,
-    )
+    if args.lora_type == "lokr":
+        injector = LycorisInjector(
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
+            factor=args.lokr_factor,
+        )
+    else:
+        injector = LoRAInjector(
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
+            use_lokr=False,
+            factor=args.lokr_factor,
+        )
     injector.inject(model)
 
     # 数据集

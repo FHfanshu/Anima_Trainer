@@ -27,6 +27,7 @@ python -m venv .venv
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 pip install numpy Pillow safetensors transformers einops pyyaml rich tiktoken
 pip install xformers --index-url https://download.pytorch.org/whl/cu130
+pip install lycoris-lora
 ```
 
 ## 快速开始
