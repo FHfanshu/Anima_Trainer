@@ -1,130 +1,79 @@
-# Anima LoRA Trainer
+# Anima Trainer v1.02
 
-一个轻量级的 **Anima** LoRA/LoKr 训练脚本，支持 YAML 配置文件，输出兼容 ComfyUI。
+Anima (Cosmos-Predict2) LoRA/LoKr trainer for Windows.
 
-## 特性
+## Overview
 
-- **YAML 配置文件** - 通过 `--config` 加载配置
-- **LoRA / LoKr 双模式** - 标准 LoRA 和 LyCORIS LoKr
-- **ComfyUI 兼容** - 输出的 safetensors 可直接在 ComfyUI 中使用
-- **VAE Latent 缓存** - 自动缓存到 npz 文件，加速后续训练
-- **xformers 支持** - 可选启用 memory efficient attention
-- **Rich 进度条** - 实时显示 loss 曲线
+- Single-file trainer entry: `anima_train.py`
+- Config via TOML: `--config ./anima_lora_config.toml`
+- Supports `lora` and `lokr`
+- Optional ComfyUI key conversion on save
+- Optional W&B logging
 
-## 安装
+## Repository Layout
 
-```bash
-git clone https://github.com/FHfanshu/Anima_Trainer.git
-cd Anima_Trainer
+- `anima_train.py`: main training script
+- `config_loader.py`: TOML config loader
+- `anima_lora_config.example.toml`: generic config template
+- `install_dependencies.bat`: one-click dependency installer (Windows)
+- `convert_lora_to_comfyui.py`: LoRA key conversion utility
+- `fix_comfyui_lora_keys.py`: key-fix helper
+- `models/`: modeling code
+- `anima/text_encoders/`: tokenizer/config assets
+- `gui/`: optional GUI module
 
-# 创建虚拟环境
-python -m venv .venv
+## Quick Start
 
-# Windows
-.\.venv\Scripts\activate
+1. Clone repo and enter directory.
+2. Run dependency installer:
 
-# 安装依赖
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
-pip install numpy Pillow safetensors transformers einops pyyaml rich tiktoken
-pip install xformers --index-url https://download.pytorch.org/whl/cu130
-pip install lycoris-lora
+```bat
+install_dependencies.bat
 ```
 
-## 快速开始
+3. Create your local config from template:
 
-### 1. 准备模型文件
-
-```
-models/
-├── transformers/
-│   └── anima-preview.safetensors
-├── vae/
-│   └── qwen_image_vae.safetensors
-└── text_encoders/
-    ├── config.json              # 已包含在仓库中
-    ├── tokenizer_config.json    # 已包含在仓库中
-    └── model.safetensors        # 需下载 Qwen3-0.6B 权重
+```bat
+copy anima_lora_config.example.toml anima_lora_config.toml
 ```
 
-**注意**: `text_encoders/` 目录需要 Qwen3 模型权重文件 `model.safetensors`，可从 [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B/tree/main) 下载。
+4. Edit `anima_lora_config.toml`:
+- Set model paths in `[model]`
+- Set dataset path in `[dataset].data_dir`
+- Set output name/path in `[lora]` and `[output]`
 
-### 2. 准备数据集
+5. Start training:
 
-```
-dataset/
-├── image001.jpg
-├── image001.txt
-├── image002.png
-├── image002.txt
-└── ...
+```bat
+.venv\Scripts\python.exe anima_train.py --config .\anima_lora_config.toml
 ```
 
-`.txt` 文件包含 Danbooru 风格标签。
+## Model Files
 
-### 3. 编辑配置文件
+Weight files are not stored in this repository.
+Place your local model files under paths you configure, for example:
 
-复制并编辑 `config/train_template.yaml`。
+- `anima/diffusion_models/*.safetensors`
+- `anima/vae/*.safetensors`
+- `anima/text_encoders/` (tokenizer + encoder files)
 
-### 4. 开始训练
+## Notes
 
-```bash
-python anima_train.py --config ./config/train_template.yaml
-```
+- `anima_lora_config.toml` is intentionally ignored and should stay local.
+- Use `anima_lora_config.example.toml` as the shared template.
+- For `adamw8bit`, install `bitsandbytes` separately if needed.
 
-命令行参数可覆盖配置文件：
+## Contributors
 
-```bash
-python anima_train.py --config ./config/train_template.yaml --lr 5e-5
-```
+- [FHfanshu](https://github.com/FHfanshu)
+- OpenAI Codex
 
-## 配置说明
+## Acknowledgements
 
-```yaml
-# 模型路径
-transformer_path: "models/transformers/anima-preview.safetensors"
-vae_path: "models/vae/qwen_image_vae.safetensors"
-text_encoder_path: "models/text_encoders"
-
-# 数据集
-data_dir: "./dataset"
-resolution: 1024
-repeats: 10
-shuffle_caption: true
-cache_latents: true
-
-# LoRA
-lora_type: "lokr"      # lora 或 lokr
-lora_rank: 32
-lora_alpha: 32
-
-# 训练
-epochs: 50
-batch_size: 1
-grad_accum: 4
-learning_rate: 1e-4
-mixed_precision: "bf16"
-grad_checkpoint: true
-xformers: true
-
-# 保存
-output_dir: "./output"
-save_every: 5          # 每 N 个 epoch 保存
-sample_every: 5        # 每 N 个 epoch 采样
-```
-
-## 硬件要求
-
-- GPU: 24GB+ 显存 (RTX 3090/4090)
-- RAM: 32GB+
-
-## 致谢
-
-- 本项目参考了网络上流传的 Anima 训练脚本，原作者不详，如有侵权请联系删除
-- [Claude Opus 4.5](https://claude.ai)
-- OpenAI Codex (ChatGPT)
+- Community references for LoRA/LoKr training workflows
+- PyTorch, Transformers, LyCORIS, Weights & Biases
 
 ## License
 
-本项目代码采用 MIT License。
-
-**注意**: Anima 模型和 Cosmos 相关代码请遵守其原始协议。
+MIT License for this repository code.
+Please follow original licenses/terms for upstream models and third-party assets.
