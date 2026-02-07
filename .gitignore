@@ -41,11 +41,12 @@ scripts/
 *.ckpt
 *.bin
 *.npz
-models/text_encoders/tokenizer.json
-models/text_encoders/vocab.json
+*.pt
+*.pth
 
 # Misc
 nul
 =2.14.0
 AGENTS.md
 CLAUDE.md
+anima_lora_config.toml

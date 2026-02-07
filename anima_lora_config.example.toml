@@ -1,0 +1,92 @@
+# Anima LoRA Trainer config template
+# Copy to anima_lora_config.toml and edit values for your machine.
+
+[model]
+transformer_path  = "./anima/diffusion_models/<model>.safetensors"
+vae_path          = "./anima/vae/<vae>.safetensors"
+text_encoder_path = "./anima/text_encoders"
+t5_tokenizer_path = ""
+
+[dataset]
+data_dir                  = "./datasets/your_dataset"
+resolution                = 1024
+min_reso                  = 512
+max_reso                  = 1536
+reso_step                 = 64
+max_ar                    = 3.0
+repeats                   = 1
+shuffle_caption           = true
+shuffle_caption_per_epoch = false
+keep_tokens               = 0
+flip_augment              = false
+cache_latents             = true
+cache_dir                 = ""
+
+[lora]
+lora_name           = "your_lora_name"
+network_type        = "lokr"  # lora / lokr
+lora_rank           = 64
+lora_alpha          = 64
+lora_dropout        = 0.0
+lora_targets        = ""
+lokr_factor         = 8
+lokr_use_tucker     = false
+lokr_decompose_both = false
+lokr_full_matrix    = false
+lokr_rank_dropout   = 0.0
+lokr_module_dropout = 0.0
+lokr_constraint     = 0.0
+lokr_normalize      = false
+
+[training]
+epochs          = 5
+max_steps       = 0
+batch_size      = 8
+grad_accum      = 4
+learning_rate   = 1e-4
+mixed_precision = "bf16"
+grad_checkpoint = true
+num_workers     = 0
+xformers        = true
+seed            = 42
+auto_install    = true
+seq_len         = 384
+log_every       = 1
+text_cache_size = 0
+resume          = ""
+
+[optimizer]
+type                         = "adamw"
+weight_decay                 = 0.01
+beta1                        = 0.9
+beta2                        = 0.999
+eps                          = 1e-8
+prodigy_beta3                = 0.999
+prodigy_d0                   = 1e-6
+prodigy_d_coef               = 1.0
+prodigy_growth_rate          = inf
+prodigy_slice_p              = 1
+prodigy_decouple             = true
+prodigy_use_bias_correction  = true
+prodigy_safeguard_warmup     = true
+
+[output]
+output_dir       = "./output"
+output_name      = "your_lora_name"
+save_every       = 1
+comfyui_format   = true
+save_state       = true
+save_state_every = 5
+
+[monitor]
+enabled      = true
+every        = 5
+memory       = true
+wandb        = true
+alert_policy = "warn"
+
+[wandb]
+enabled   = false
+project   = "anima-trainer"
+mode      = "online"
+log_every = 1

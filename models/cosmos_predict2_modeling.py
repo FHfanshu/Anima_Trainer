@@ -1376,12 +1376,33 @@ class MiniTrainDIT(nn.Module):
             - Otherwise, the positional embeddings are generated without considering fps.
         """
         if self.concat_padding_mask:
-            padding_mask = transforms.functional.resize(
-                padding_mask, list(x_B_C_T_H_W.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
-            )
-            x_B_C_T_H_W = torch.cat(
-                [x_B_C_T_H_W, padding_mask.unsqueeze(1).repeat(1, 1, x_B_C_T_H_W.shape[2], 1, 1)], dim=1
-            )
+            # Expected padding_mask is spatial (B,1,H,W) with 0 indicating "valid" (no padding).
+            # Be permissive in accepted shapes to avoid runtime crashes.
+            B, _, T, H, W = x_B_C_T_H_W.shape
+
+            if padding_mask is None:
+                pad4 = torch.zeros((B, 1, H, W), device=x_B_C_T_H_W.device, dtype=x_B_C_T_H_W.dtype)
+                pad5 = pad4.unsqueeze(1).repeat(1, 1, T, 1, 1)
+            else:
+                if padding_mask.dim() == 3:
+                    padding_mask = padding_mask.unsqueeze(1)
+
+                if padding_mask.dim() == 4 and padding_mask.shape[:2] == (B, 1):
+                    pad4 = transforms.functional.resize(
+                        padding_mask,
+                        [H, W],
+                        interpolation=transforms.InterpolationMode.NEAREST,
+                    ).to(device=x_B_C_T_H_W.device, dtype=x_B_C_T_H_W.dtype)
+                    pad5 = pad4.unsqueeze(1).repeat(1, 1, T, 1, 1)
+                elif padding_mask.dim() == 5 and padding_mask.shape[0] == B and padding_mask.shape[1] == 1:
+                    # Assume already in (B,1,T,H,W)
+                    pad5 = padding_mask.to(device=x_B_C_T_H_W.device, dtype=x_B_C_T_H_W.dtype)
+                    if pad5.shape[2] != T or pad5.shape[3] != H or pad5.shape[4] != W:
+                        pad5 = torch.zeros((B, 1, T, H, W), device=x_B_C_T_H_W.device, dtype=x_B_C_T_H_W.dtype)
+                else:
+                    pad5 = torch.zeros((B, 1, T, H, W), device=x_B_C_T_H_W.device, dtype=x_B_C_T_H_W.dtype)
+
+            x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, pad5], dim=1)
         x_B_T_H_W_D = self.x_embedder(x_B_C_T_H_W)
 
         if self.extra_per_block_abs_pos_emb:
