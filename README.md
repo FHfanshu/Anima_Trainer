@@ -71,6 +71,7 @@ Place your local model files under paths you configure, for example:
 ## Acknowledgements
 
 - Community references for LoRA/LoKr training workflows
+- This training script references community-circulated implementations (including upper directory v1.01). If any content infringes your rights, please contact for removal.
 - PyTorch, Transformers, LyCORIS, Weights & Biases
 
 ## License
