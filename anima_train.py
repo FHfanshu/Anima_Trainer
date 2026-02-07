@@ -21,6 +21,7 @@ Set DIFFUSION_PIPE_ROOT if your diffusion-pipe-main path is non-standard.
 """
 
 import argparse
+import contextlib
 import math
 import json
 import logging
@@ -49,6 +50,9 @@ try:
     XFORMERS_AVAILABLE = True
 except ImportError:
     pass
+
+TRAIN_PARTS_CHOICES = ("dit_only", "dit_llm_adapter", "dit_llm_adapter_qwen")
+DEFAULT_TRAIN_PARTS = "dit_llm_adapter"
 
 
 def find_diffusion_pipe_root():
@@ -549,6 +553,7 @@ def _maybe_init_wandb(args, logger):
             "lora_dropout": args.lora_dropout,
             "lora_targets": args.lora_targets,
             "network_type": getattr(args, "network_type", "lora"),
+            "train_parts": getattr(args, "train_parts", DEFAULT_TRAIN_PARTS),
             "lokr_factor": getattr(args, "lokr_factor", 8),
             "lokr_use_tucker": getattr(args, "lokr_use_tucker", False),
             "lokr_decompose_both": getattr(args, "lokr_decompose_both", False),
@@ -806,12 +811,13 @@ def xformers_attention(q, k, v):
     return out.transpose(1, 2).reshape(B, S, H * D)
 
 
-def compute_qwen_embeddings(qwen_model, input_ids, attention_mask):
+def compute_qwen_embeddings(qwen_model, input_ids, attention_mask, *, no_grad=True):
     if attention_mask is None:
         attention_mask = torch.ones_like(input_ids)
     input_ids = input_ids.to(qwen_model.device, dtype=torch.long)
     attention_mask = attention_mask.to(qwen_model.device, dtype=torch.long)
-    with torch.no_grad():
+    grad_ctx = torch.no_grad() if no_grad else contextlib.nullcontext()
+    with grad_ctx:
         outputs = qwen_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1708,6 +1714,11 @@ def convert_key_to_comfyui(old_key: str) -> str:
     return new_key.replace("diffusion_model.llm.adapter.", "diffusion_model.llm_adapter.")
 
 
+def _is_llm_adapter_module_name(name: str) -> bool:
+    n = str(name or "").replace("\\", "/")
+    return ("llm_adapter." in n) or ("llm.adapter." in n)
+
+
 class _BaseInjector:
     network_type = "lora"
 
@@ -1721,6 +1732,8 @@ class _BaseInjector:
 
     def _should_inject(self, name: str, module: torch.nn.Module) -> bool:
         if not isinstance(module, torch.nn.Linear):
+            return False
+        if getattr(self, "exclude_llm_adapter_modules", False) and _is_llm_adapter_module_name(name):
             return False
         layer_name = name.split(".")[-1]
         for raw_target in self.target_modules:
@@ -1772,9 +1785,11 @@ class _BaseInjector:
             self.injected_layers[full_name] = wrapped
         return injected
 
-    def get_trainable_params(self):
+    def get_trainable_params(self, *, include_llm_adapter: bool = True):
         params = []
-        for layer in self.injected_layers.values():
+        for name, layer in self.injected_layers.items():
+            if (not include_llm_adapter) and _is_llm_adapter_module_name(name):
+                continue
             if hasattr(layer, "lora"):
                 params.extend(layer.lora.parameters())
             elif hasattr(layer, "lokr"):
@@ -2153,6 +2168,7 @@ def save_training_state(
         "rng_state": _get_rng_state(),
         "args_snapshot": {
             "network_type": str(getattr(args, "network_type", "lora") or "lora"),
+            "train_parts": str(getattr(args, "train_parts", DEFAULT_TRAIN_PARTS) or DEFAULT_TRAIN_PARTS),
             "lora_rank": int(args.lora_rank),
             "lora_alpha": float(args.lora_alpha),
             "lora_targets": str(args.lora_targets or ""),
@@ -2308,6 +2324,12 @@ def parse_args():
     parser.add_argument("--lokr-module-dropout", type=float, default=0.0)
     parser.add_argument("--lokr-constraint", type=float, default=0.0)
     parser.add_argument("--lokr-normalize", action="store_true")
+    parser.add_argument(
+        "--train-parts",
+        choices=list(TRAIN_PARTS_CHOICES),
+        default=DEFAULT_TRAIN_PARTS,
+        help="Trainable components: dit_only / dit_llm_adapter(LoRA on llm_adapter) / dit_llm_adapter_qwen(full llm_adapter, qwen frozen)",
+    )
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=10)
@@ -2379,6 +2401,10 @@ def validate_args(args, logger):
     mp = str(getattr(args, "mixed_precision", "") or "")
     if mp not in ("fp32", "fp16", "bf16"):
         logger.error("--mixed-precision must be one of: fp32, fp16, bf16 (got: %s)", mp)
+        raise SystemExit(2)
+    args.train_parts = str(getattr(args, "train_parts", DEFAULT_TRAIN_PARTS) or DEFAULT_TRAIN_PARTS).lower()
+    if args.train_parts not in TRAIN_PARTS_CHOICES:
+        logger.error("--train-parts must be one of: %s (got: %s)", ", ".join(TRAIN_PARTS_CHOICES), args.train_parts)
         raise SystemExit(2)
 
     try:
@@ -2798,6 +2824,11 @@ def main():
         return
 
     validate_args(args, logger)
+    train_parts = str(getattr(args, "train_parts", DEFAULT_TRAIN_PARTS) or DEFAULT_TRAIN_PARTS).lower()
+    train_llm_adapter_lora = train_parts == "dit_llm_adapter"
+    train_llm_adapter_full = train_parts == "dit_llm_adapter_qwen"
+    train_llm_adapter = train_llm_adapter_lora or train_llm_adapter_full
+    logger.info("Training parts mode: %s", train_parts)
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -2840,13 +2871,68 @@ def main():
     else:
         logger.info("T5 tokenizer enabled.")
 
+    if train_llm_adapter:
+        if not hasattr(model, "llm_adapter"):
+            logger.error("train_parts=%s requires model.llm_adapter, but current model has no llm_adapter", train_parts)
+            return
+        if t5_tokenizer is None:
+            logger.error(
+                "train_parts=%s requires T5 tokenizer (llm_adapter uses text_ids). Set --t5-tokenizer-dir or provide configs/t5_old",
+                train_parts,
+            )
+            return
+    if train_llm_adapter and qwen_model is None:
+        logger.error("train_parts=%s requires --qwen to be set and loadable", train_parts)
+        return
+
+    if hasattr(model, "llm_adapter"):
+        model.llm_adapter.train(mode=train_llm_adapter)
+        for p in model.llm_adapter.parameters():
+            p.requires_grad = bool(train_llm_adapter_full)
+
+    if qwen_model is not None:
+        # Qwen remains frozen in all modes. `dit_llm_adapter_qwen` means full llm_adapter,
+        # not Qwen fine-tuning.
+        qwen_model.eval()
+        qwen_model.requires_grad_(False)
+
     # LoRA 注入
     target_modules = resolve_target_modules(args, model, logger)
 
     lora_injector = build_network_injector(args, target_modules)
+    # `dit_llm_adapter` matches legacy behavior: include llm_adapter in LoRA/LoKr injection.
+    # `dit_llm_adapter_qwen` uses full llm_adapter (no llm_adapter injection).
+    lora_injector.exclude_llm_adapter_modules = (not train_llm_adapter_lora)
     lora_injector.set_training_metadata(args, target_modules)
     lora_injector.inject_model(model, prefix="transformer")
-    trainable_params = lora_injector.get_trainable_params()
+    adapter_trainable_params = list(lora_injector.get_trainable_params(include_llm_adapter=train_llm_adapter_lora))
+    if len(adapter_trainable_params) == 0:
+        raise RuntimeError("No trainable adapter params found after injection. Check target modules.")
+
+    llm_adapter_trainable_params = []
+    if train_llm_adapter_full and hasattr(model, "llm_adapter"):
+        llm_adapter_trainable_params = [p for p in model.llm_adapter.parameters() if p.requires_grad]
+        if len(llm_adapter_trainable_params) == 0:
+            raise RuntimeError("train_parts enables full llm_adapter training, but no llm_adapter params are trainable.")
+
+    trainable_params = list(adapter_trainable_params) + llm_adapter_trainable_params
+    seen_param_ids = set()
+    dedup_trainable_params = []
+    for p in trainable_params:
+        pid = id(p)
+        if pid in seen_param_ids:
+            continue
+        seen_param_ids.add(pid)
+        dedup_trainable_params.append(p)
+    trainable_params = dedup_trainable_params
+    if len(trainable_params) == 0:
+        raise RuntimeError("No trainable parameters collected for optimizer.")
+    llm_adapter_injected_layers = sum(
+        1 for full_name in lora_injector.injected_layers.keys() if _is_llm_adapter_module_name(full_name)
+    )
+    active_llm_adapter_injected_layers = 0
+    if train_llm_adapter_lora:
+        active_llm_adapter_injected_layers = llm_adapter_injected_layers
     # Summarize injected layer coverage to catch mis-targeting early.
     try:
         from collections import Counter
@@ -2860,10 +2946,21 @@ def main():
     except Exception:
         logger.info("Injected %d LoRA layers", len(lora_injector.injected_layers))
     logger.info(
-        "Injected %s with rank=%d, alpha=%.1f, %d trainable params",
+        "Injected %s with rank=%d, alpha=%.1f, %d adapter params",
         str(getattr(args, "network_type", "lora")).upper(),
         args.lora_rank,
         args.lora_alpha,
+        sum(p.numel() for p in adapter_trainable_params),
+    )
+    logger.info(
+        "Injected llm_adapter layers: total=%d, active_for_optimizer=%d",
+        llm_adapter_injected_layers,
+        active_llm_adapter_injected_layers,
+    )
+    logger.info(
+        "train_parts summary: llm_adapter_mode=%s full_params=%d qwen=frozen total_trainable=%d",
+        "lora" if train_llm_adapter_lora else ("full" if train_llm_adapter_full else "off"),
+        sum(p.numel() for p in llm_adapter_trainable_params),
         sum(p.numel() for p in trainable_params),
     )
 
@@ -2987,6 +3084,14 @@ def main():
             getattr(args, "optimizer", "adamw")
         ).lower():
             raise RuntimeError("Resume mismatch: optimizer type differs from checkpoint")
+        ckpt_train_parts = str(snap.get("train_parts", "") or "").lower()
+        cur_train_parts = str(getattr(args, "train_parts", DEFAULT_TRAIN_PARTS) or DEFAULT_TRAIN_PARTS).lower()
+        if ckpt_train_parts and ckpt_train_parts != cur_train_parts:
+            logger.warning(
+                "Resume warning: train_parts differs (ckpt=%s current=%s). Optimizer state may not map perfectly.",
+                ckpt_train_parts,
+                cur_train_parts,
+            )
 
         lora_injector.load_state_dict(state["lora_state"], strict=True)
         optimizer.load_state_dict(state["optimizer_state"])
@@ -3108,29 +3213,37 @@ def main():
 
                 bs = latents.shape[0]
 
-                # 编码文本：Qwen embeddings；如 T5 tokenizer 可用则通过 llm_adapter 进一步处理。
-                with torch.no_grad():
-                    if qwen_tokenizer and qwen_model:
-                        toks = tokenize_qwen(qwen_tokenizer, captions, args.seq_len)
-                        qwen_input_ids = toks["input_ids"]
-                        qwen_attention_mask = toks["attention_mask"]
+                # 编码文本：根据 train_parts 决定 qwen/llm_adapter 是否参与梯度。
+                if qwen_tokenizer and qwen_model:
+                    toks = tokenize_qwen(qwen_tokenizer, captions, args.seq_len)
+                    qwen_input_ids = toks["input_ids"]
+                    qwen_attention_mask = toks["attention_mask"]
 
-                        t5_ids = None
-                        if t5_tokenizer is not None:
-                            t5_toks = tokenize_t5(t5_tokenizer, captions, max_length=args.seq_len)
-                            t5_ids = t5_toks["input_ids"].to(device)
+                    t5_ids = None
+                    if t5_tokenizer is not None:
+                        t5_toks = tokenize_t5(t5_tokenizer, captions, max_length=args.seq_len)
+                        t5_ids = t5_toks["input_ids"].to(device)
 
-                        qwen_embeds = compute_qwen_embeddings(qwen_model, qwen_input_ids, qwen_attention_mask)
-                        qwen_embeds = qwen_embeds.to(device=device, dtype=dtype)
+                    qwen_embeds = compute_qwen_embeddings(
+                        qwen_model,
+                        qwen_input_ids,
+                        qwen_attention_mask,
+                        no_grad=True,
+                    )
+                    qwen_embeds = qwen_embeds.to(device=device, dtype=dtype)
 
+                    if train_llm_adapter:
                         cross = model.preprocess_text_embeds(qwen_embeds, t5_ids)
-                        if cross.shape[1] < args.seq_len:
-                            cross = F.pad(cross, (0, 0, 0, args.seq_len - cross.shape[1]))
-                        elif cross.shape[1] > args.seq_len:
-                            cross = cross[:, : args.seq_len]
                     else:
-                        # Fallback: keep shape consistent, but training quality will degrade without proper encoders.
-                        cross = torch.zeros(bs, args.seq_len, 1024, device=device, dtype=dtype)
+                        with torch.no_grad():
+                            cross = model.preprocess_text_embeds(qwen_embeds, t5_ids)
+                    if cross.shape[1] < args.seq_len:
+                        cross = F.pad(cross, (0, 0, 0, args.seq_len - cross.shape[1]))
+                    elif cross.shape[1] > args.seq_len:
+                        cross = cross[:, : args.seq_len]
+                else:
+                    # Fallback: keep shape consistent, but training quality will degrade without proper encoders.
+                    cross = torch.zeros(bs, args.seq_len, 1024, device=device, dtype=dtype)
 
                 # 采样时间步和噪声
                 t = sample_t(bs, device)
@@ -3169,12 +3282,12 @@ def main():
                 # 梯度累积完成后更新
                 if (batch_idx + 1) % args.grad_accum == 0:
                     grad_watch_checks = _check_adapter_gradients(
-                        trainable_params,
+                        adapter_trainable_params,
                         logger,
                         step_hint=global_step + 1,
                         remaining_checks=grad_watch_checks,
                     )
-                    grad_nonzero_ratio = _compute_grad_nonzero_ratio(trainable_params)
+                    grad_nonzero_ratio = _compute_grad_nonzero_ratio(adapter_trainable_params)
                     _maybe_clip_grads(args, scaler=scaler, optimizer=optimizer, trainable_params=trainable_params)
                     if scaler:
                         scaler.step(optimizer)
@@ -3264,12 +3377,12 @@ def main():
                             p.grad.mul_(factor)
 
                 grad_watch_checks = _check_adapter_gradients(
-                    trainable_params,
+                    adapter_trainable_params,
                     logger,
                     step_hint=global_step + 1,
                     remaining_checks=grad_watch_checks,
                 )
-                grad_nonzero_ratio = _compute_grad_nonzero_ratio(trainable_params)
+                grad_nonzero_ratio = _compute_grad_nonzero_ratio(adapter_trainable_params)
                 _maybe_clip_grads(args, scaler=scaler, optimizer=optimizer, trainable_params=trainable_params)
                 if scaler:
                     scaler.step(optimizer)

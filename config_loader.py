@@ -108,6 +108,7 @@ def apply_config_to_args(args, config: dict) -> None:
     _set_if_default(args, "text_cache_size", training_config.get("text_cache_size", 256), default_value=256)
     _set_if_default(args, "seq_len", training_config.get("seq_len", 512), default_value=512)
     _set_if_default(args, "log_every", training_config.get("log_every", 10), default_value=10)
+    _set_if_default(args, "train_parts", training_config.get("train_parts", "dit_llm_adapter"), default_value="dit_llm_adapter")
     _set_if_default(args, "auto_install", training_config.get("auto_install", False), default_value=False)
     _set_if_default(args, "interactive", training_config.get("interactive", False), default_value=False)
 
