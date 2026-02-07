@@ -1,6 +1,7 @@
 # Anima Trainer v1.02
 
 Anima (Cosmos-Predict2) LoRA/LoKr trainer for Windows.
+中文说明请见: [README.zh-CN.md](./README.zh-CN.md)
 
 ## Overview
 
