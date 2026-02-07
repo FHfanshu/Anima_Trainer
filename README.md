@@ -17,11 +17,8 @@ Anima (Cosmos-Predict2) LoRA/LoKr trainer for Windows.
 - `config_loader.py`: TOML config loader
 - `anima_lora_config.example.toml`: generic config template
 - `install_dependencies.bat`: one-click dependency installer (Windows)
-- `convert_lora_to_comfyui.py`: LoRA key conversion utility
-- `fix_comfyui_lora_keys.py`: key-fix helper
 - `models/`: modeling code
 - `anima/text_encoders/`: tokenizer/config assets
-- `gui/`: optional GUI module
 
 ## Quick Start
 
