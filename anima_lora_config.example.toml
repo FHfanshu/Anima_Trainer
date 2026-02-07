@@ -82,11 +82,11 @@ save_state_every = 5
 enabled      = true
 every        = 5
 memory       = true
-wandb        = true
+wandb        = true    # 子开关: 仅当 [wandb].enabled=true 时，才把 monitor 指标上报到 W&B
 alert_policy = "warn"
 
 [wandb]
-enabled   = false
+enabled   = false      # 总开关: false=不初始化 W&B（即使 monitor.wandb=true 也不会上传）
 project   = "anima-trainer"
-mode      = "online"
+mode      = "online"   # online / offline / disabled（仅在 enabled=true 时生效）
 log_every = 1
