@@ -53,6 +53,9 @@ except ImportError:
 
 TRAIN_PARTS_CHOICES = ("dit_only", "dit_llm_adapter", "dit_llm_adapter_qwen")
 DEFAULT_TRAIN_PARTS = "dit_llm_adapter"
+T5_REQUIRED_TRAIN_PARTS = {"dit_llm_adapter", "dit_llm_adapter_qwen"}
+T5_EXPECTED_VOCAB_SIZE = 32128
+T5_REQUIRED_FILES = ("config.json", "spiece.model", "tokenizer.json")
 
 
 def find_diffusion_pipe_root():
@@ -338,9 +341,10 @@ def load_state_dict(path):
     return sd
 
 
-def load_anima_model(ckpt_path, device, dtype, repo_root):
+def load_anima_model(ckpt_path, device, dtype, repo_root, *, attention_backend="torch"):
     Anima = load_anima_classes(repo_root)
     config = load_config_from_ckpt(ckpt_path)
+    config["atten_backend"] = str(attention_backend or "torch")
     model = Anima(**config)
     sd = load_state_dict(ckpt_path)
     missing, unexpected = model.load_state_dict(sd, strict=False)
@@ -401,7 +405,7 @@ def load_qwen(qwen_path, device, dtype):
     model = AutoModelForCausalLM.from_pretrained(
         qwen_path,
         config=config,
-        dtype=dtype,
+        torch_dtype=dtype,
         local_files_only=True,
         trust_remote_code=True,
     )
@@ -410,12 +414,145 @@ def load_qwen(qwen_path, device, dtype):
     return tokenizer, model
 
 
+def _validate_t5_tokenizer_dir(t5_dir: Path):
+    from transformers import T5TokenizerFast
+
+    t5_dir = Path(t5_dir)
+    missing = [name for name in T5_REQUIRED_FILES if not (t5_dir / name).exists()]
+    if missing:
+        missing_str = ", ".join(missing)
+        raise ValueError(f"T5 tokenizer directory is missing required files: {missing_str} (dir={t5_dir})")
+
+    config_path = t5_dir / "config.json"
+    tokenizer_json_path = t5_dir / "tokenizer.json"
+    spiece_path = t5_dir / "spiece.model"
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception as exc:
+        raise ValueError(f"Failed to parse {config_path}: {exc}") from exc
+
+    if str(cfg.get("model_type", "")).lower() != "t5":
+        raise ValueError(f"T5 config model_type must be 't5' (got: {cfg.get('model_type')})")
+    cfg_vocab_size = int(cfg.get("vocab_size", -1))
+    if cfg_vocab_size != T5_EXPECTED_VOCAB_SIZE:
+        raise ValueError(
+            f"T5 config vocab_size must be {T5_EXPECTED_VOCAB_SIZE} (got: {cfg_vocab_size})"
+        )
+
+    try:
+        with open(tokenizer_json_path, "r", encoding="utf-8") as f:
+            tok_cfg = json.load(f)
+    except Exception as exc:
+        raise ValueError(f"Failed to parse {tokenizer_json_path}: {exc}") from exc
+
+    model_cfg = tok_cfg.get("model")
+    if not isinstance(model_cfg, dict):
+        raise ValueError("tokenizer.json must contain a top-level 'model' object")
+
+    model_type = model_cfg.get("type")
+    if model_type != "Unigram":
+        raise ValueError(f"tokenizer.json model.type must be 'Unigram' (got: {model_type})")
+
+    vocab = model_cfg.get("vocab")
+    if not isinstance(vocab, list) or len(vocab) == 0:
+        raise ValueError("tokenizer.json model.vocab must be a non-empty list")
+
+    token_to_id = {}
+    for idx, entry in enumerate(vocab):
+        token = None
+        if isinstance(entry, list) and len(entry) >= 1:
+            token = str(entry[0])
+        elif isinstance(entry, dict) and "token" in entry:
+            token = str(entry["token"])
+        if token is not None:
+            token_to_id[token] = idx
+
+    if not token_to_id:
+        raise ValueError("tokenizer.json model.vocab has no parseable token entries")
+
+    added_tokens = tok_cfg.get("added_tokens", [])
+    if not isinstance(added_tokens, list):
+        raise ValueError("tokenizer.json added_tokens must be a list")
+    added_token_to_id = {}
+    max_added_id = -1
+    for entry in added_tokens:
+        if not isinstance(entry, dict):
+            continue
+        content = entry.get("content")
+        token_id = entry.get("id")
+        if content is None or token_id is None:
+            continue
+        try:
+            token_id = int(token_id)
+        except Exception:
+            continue
+        added_token_to_id[str(content)] = token_id
+        if token_id > max_added_id:
+            max_added_id = token_id
+
+    def _resolve_token_id(token: str):
+        if token in added_token_to_id:
+            return int(added_token_to_id[token])
+        if token in token_to_id:
+            return int(token_to_id[token])
+        return None
+
+    max_vocab_id = len(vocab) - 1
+    max_token_id = max(max_vocab_id, max_added_id)
+    if max_token_id >= T5_EXPECTED_VOCAB_SIZE:
+        raise ValueError(
+            f"tokenizer max token id must be < {T5_EXPECTED_VOCAB_SIZE} (got: {max_token_id})"
+        )
+
+    required_ids = {"<pad>": 0, "</s>": 1, "<unk>": 2}
+    for token, expected in required_ids.items():
+        actual = _resolve_token_id(token)
+        if actual is None:
+            raise ValueError(f"tokenizer is missing required token: {token}")
+        if int(actual) != int(expected):
+            raise ValueError(f"token {token} id must be {expected} (got: {actual})")
+
+    for token in ("<extra_id_99>", "<extra_id_0>"):
+        actual = _resolve_token_id(token)
+        if actual is None:
+            raise ValueError(f"tokenizer is missing required token: {token}")
+        if int(actual) < 0 or int(actual) >= T5_EXPECTED_VOCAB_SIZE:
+            raise ValueError(f"token {token} id out of range: {actual}")
+
+    try:
+        tokenizer = T5TokenizerFast(
+            vocab_file=str(spiece_path),
+            tokenizer_file=str(tokenizer_json_path),
+        )
+        smoke = tokenizer(
+            ["t5 tokenizer strict smoke check"],
+            return_tensors="pt",
+            truncation=True,
+            padding="max_length",
+            max_length=16,
+        )
+        input_ids = smoke["input_ids"]
+        if input_ids.numel() <= 0:
+            raise ValueError("T5 tokenizer smoke check produced empty input_ids")
+        max_input_id = int(input_ids.max().item())
+        min_input_id = int(input_ids.min().item())
+        if min_input_id < 0 or max_input_id >= T5_EXPECTED_VOCAB_SIZE:
+            raise ValueError(
+                f"T5 tokenizer smoke check produced out-of-range ids: [{min_input_id}, {max_input_id}]"
+            )
+    except Exception as exc:
+        raise ValueError(f"T5 tokenizer fast smoke check failed: {exc}") from exc
+
+
 def load_t5_tokenizer(repo_root, t5_dir=None):
     from transformers import T5TokenizerFast
 
     if t5_dir is None:
         t5_dir = repo_root / "configs" / "t5_old"
     t5_dir = Path(t5_dir)
+    _validate_t5_tokenizer_dir(t5_dir)
     return T5TokenizerFast(
         vocab_file=str(t5_dir / "spiece.model"),
         tokenizer_file=str(t5_dir / "tokenizer.json"),
@@ -825,12 +962,14 @@ def compute_qwen_embeddings(qwen_model, input_ids, attention_mask, *, no_grad=Tr
             return_dict=True,
         )
     hidden_states = outputs.hidden_states[-1]
-    lengths = attention_mask.sum(dim=1).cpu()
+    lengths = attention_mask.sum(dim=1).to(device="cpu", dtype=torch.int64)
+    seq_len = int(hidden_states.shape[1])
     for batch_id in range(hidden_states.shape[0]):
-        length = lengths[batch_id]
+        length = int(lengths[batch_id].item())
         if length == 1:
             length = 0
-        hidden_states[batch_id][length:] = 0
+        length = max(0, min(length, seq_len))
+        hidden_states[batch_id, length:] = 0
     return hidden_states
 
 
@@ -1158,7 +1297,12 @@ class CaptionDataset(Dataset):
         import numpy as np
         from PIL import Image
         sample = self.samples[idx]
-        image = Image.open(sample["image_path"]).convert("RGB")
+        image_path = sample["image_path"]
+        try:
+            with Image.open(image_path) as img:
+                image = img.convert("RGB")
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load image idx={idx} path={image_path}: {exc}") from exc
 
         tw, th = sample["target_size"]
         scale = max(tw / image.width, th / image.height)
@@ -2406,6 +2550,14 @@ def validate_args(args, logger):
     if args.train_parts not in TRAIN_PARTS_CHOICES:
         logger.error("--train-parts must be one of: %s (got: %s)", ", ".join(TRAIN_PARTS_CHOICES), args.train_parts)
         raise SystemExit(2)
+    if args.train_parts in T5_REQUIRED_TRAIN_PARTS:
+        t5_dir = str(getattr(args, "t5_tokenizer_dir", "") or "").strip()
+        if not t5_dir:
+            logger.error("--t5-tokenizer-dir is required when --train-parts=%s", args.train_parts)
+            raise SystemExit(2)
+        if not Path(t5_dir).exists():
+            logger.error("--t5-tokenizer-dir does not exist: %s", t5_dir)
+            raise SystemExit(2)
 
     try:
         args.grad_clip = float(getattr(args, "grad_clip", 0.0) or 0.0)
@@ -2724,7 +2876,8 @@ def cache_all_latents(dataset, vae, cache: LatentCache, device, dtype, logger):
 
             try:
                 # 加载并处理图像
-                image = Image.open(image_path).convert("RGB")
+                with Image.open(image_path) as img:
+                    image = img.convert("RGB")
                 tw, th = sample["target_size"]
                 scale = max(tw / image.width, th / image.height)
                 new_w = int(image.width * scale)
@@ -2750,7 +2903,7 @@ def cache_all_latents(dataset, vae, cache: LatentCache, device, dtype, logger):
 
             except Exception as e:
                 failed_count += 1
-                logger.warning("缓存失败 %s: %s", image_path, e)
+                logger.warning("缓存失败 idx=%d path=%s: %s", i, image_path, e)
 
             if pbar is not None:
                 pbar.update(1)
@@ -2813,8 +2966,8 @@ def main():
         if XFORMERS_AVAILABLE:
             logger.info("xformers 已启用")
         else:
-            logger.warning("xformers 不可用，将使用 PyTorch 原生 attention")
-            args.xformers = False
+            logger.error("--xformers requested but xformers is not available in current environment")
+            raise SystemExit(2)
 
     if not args.data_dir:
         logger.error("--data-dir is required")
@@ -2834,6 +2987,9 @@ def main():
     torch.manual_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type != "cuda":
+        logger.error("CUDA device is required. CPU training is not supported.")
+        raise SystemExit(2)
     dtype_map = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
     dtype = dtype_map.get(args.mixed_precision, torch.bfloat16)
 
@@ -2841,7 +2997,14 @@ def main():
 
     repo_root = Path(__file__).resolve().parent
     logger.info("Loading Anima model from %s", args.transformer)
-    model = load_anima_model(args.transformer, device, dtype, repo_root)
+    attention_backend = "xformers" if args.xformers else "torch"
+    model = load_anima_model(
+        args.transformer,
+        device,
+        dtype,
+        repo_root,
+        attention_backend=attention_backend,
+    )
     model.train()
     # Match v1.01: freeze base weights; only LoRA params should be trainable.
     model.requires_grad_(False)
@@ -2856,20 +3019,22 @@ def main():
         logger.info("Loading Qwen from %s", args.qwen)
         qwen_tokenizer, qwen_model = load_qwen(args.qwen, device, dtype)
 
-    # T5 tokenizer: v1.01 uses diffusion-pipe root's configs/t5_old by default.
-    # trainerv1.02 directory may not contain configs/, so we resolve T5 relative to the pipe root.
+    # T5 tokenizer is a strict requirement in llm_adapter modes.
     t5_tokenizer = None
     t5_dir = args.t5_tokenizer_dir if args.t5_tokenizer_dir else None
-    try:
-        pipe_root = find_diffusion_pipe_root()
-        t5_tokenizer = load_t5_tokenizer(pipe_root, t5_dir)
-    except Exception as exc:
-        logger.warning("Could not load T5 tokenizer: %s", exc)
-        t5_tokenizer = None
-    if t5_tokenizer is None:
-        logger.info("T5 tokenizer disabled/unavailable; training will use Qwen embeddings only (llm_adapter bypass).")
-    else:
-        logger.info("T5 tokenizer enabled.")
+    if t5_dir:
+        try:
+            t5_tokenizer = load_t5_tokenizer(repo_root, t5_dir)
+            logger.info("T5 tokenizer enabled from %s", t5_dir)
+        except Exception as exc:
+            if train_llm_adapter:
+                logger.error("Failed to load required T5 tokenizer from %s: %s", t5_dir, exc)
+                raise SystemExit(2)
+            logger.warning("Could not load optional T5 tokenizer from %s: %s", t5_dir, exc)
+            t5_tokenizer = None
+    elif train_llm_adapter:
+        logger.error("--t5-tokenizer-dir is required when train_parts=%s", train_parts)
+        raise SystemExit(2)
 
     if train_llm_adapter:
         if not hasattr(model, "llm_adapter"):
@@ -2877,7 +3042,7 @@ def main():
             return
         if t5_tokenizer is None:
             logger.error(
-                "train_parts=%s requires T5 tokenizer (llm_adapter uses text_ids). Set --t5-tokenizer-dir or provide configs/t5_old",
+                "train_parts=%s requires T5 tokenizer (llm_adapter uses text_ids). Set --t5-tokenizer-dir.",
                 train_parts,
             )
             return
@@ -3178,6 +3343,14 @@ def main():
             except Exception:
                 pass
 
+            dataloader = create_dataloader(
+                dataset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=args.num_workers,
+                pin_memory=True,
+                seed=int(args.seed) + int(epoch),
+            )
             for batch_idx, batch in enumerate(dataloader):
                 captions = batch["captions"]
 

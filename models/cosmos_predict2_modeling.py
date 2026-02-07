@@ -24,6 +24,15 @@ from torch import nn
 from torch.distributed import get_process_group_ranks
 from torchvision import transforms
 
+XFORMERS_AVAILABLE = False
+xformers_ops = None
+try:
+    import xformers.ops as xformers_ops
+
+    XFORMERS_AVAILABLE = True
+except Exception:
+    pass
+
 
 def _rotate_half(x: torch.Tensor, interleaved: bool) -> torch.Tensor:
     """Change sign so the last dimension becomes [-odd, +even]
@@ -304,6 +313,19 @@ def torch_attention_op(q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H
     return result_B_S_HD
 
 
+def xformers_attention_op(q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H_D: torch.Tensor) -> torch.Tensor:
+    """Computes multi-head attention using xformers memory efficient attention."""
+    if not XFORMERS_AVAILABLE or xformers_ops is None:
+        raise RuntimeError("xformers backend requested but xformers is not available")
+    in_q_shape = q_B_S_H_D.shape
+    q = rearrange(q_B_S_H_D, "b ... h d -> b (...) h d").contiguous()
+    k = rearrange(k_B_S_H_D, "b ... h d -> b (...) h d").contiguous()
+    v = rearrange(v_B_S_H_D, "b ... h d -> b (...) h d").contiguous()
+    out = xformers_ops.memory_efficient_attention(q, k, v)
+    out = rearrange(out, "b s h d -> b s (h d)").contiguous()
+    return out.view(in_q_shape[0], *in_q_shape[1:-2], in_q_shape[-2] * in_q_shape[-1])
+
+
 class Attention(nn.Module):
     """
     A flexible attention module supporting both self-attention and cross-attention mechanisms.
@@ -349,7 +371,7 @@ class Attention(nn.Module):
         super().__init__()
         self.is_selfattn = context_dim is None  # self attention
 
-        if backend not in ["transformer_engine", "torch"]:
+        if backend not in ["transformer_engine", "torch", "xformers"]:
             raise NotImplementedError(f"Unrecognized {backend=}.")
 
         self.backend = backend
@@ -386,6 +408,10 @@ class Attention(nn.Module):
             )
         elif self.backend == "torch":
             self.attn_op = torch_attention_op
+        elif self.backend == "xformers":
+            if not XFORMERS_AVAILABLE:
+                raise RuntimeError("xformers backend requested but xformers is not available")
+            self.attn_op = xformers_attention_op
         else:
             raise NotImplementedError()
 
@@ -1208,8 +1234,10 @@ class MiniTrainDIT(nn.Module):
         extra_w_extrapolation_ratio: float = 1.0,
         extra_t_extrapolation_ratio: float = 1.0,
         rope_enable_fps_modulation: bool = True,
+        atten_backend: str = "torch",
     ) -> None:
-        atten_backend = 'torch'
+        if atten_backend not in {"torch", "transformer_engine", "xformers"}:
+            raise ValueError(f"Unsupported atten_backend={atten_backend}")
 
         super().__init__()
         self.max_img_h = max_img_h
