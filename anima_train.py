@@ -460,6 +460,9 @@ def init_progress(show_progress, total_steps):
             TimeElapsedColumn(),
             TimeRemainingColumn(),
             refresh_per_second=10,
+            # Default speed estimate window is 30s in Rich. For very slow iterations
+            # (e.g. < 1 step / 30s), ETA remains unknown. Use a wider window.
+            speed_estimate_period=600.0,
         )
         task = progress.add_task("train", total=total_steps, loss=0.0, lr=0.0, speed=0.0)
         return progress, task, "rich"
@@ -2481,7 +2484,10 @@ def _check_adapter_gradients(trainable_params, logger, *, step_hint: int, remain
             total,
             max_abs,
         )
-        return 0
+        # Keep printing until every trainable tensor has non-zero gradient.
+        if nonzero >= total and total > 0:
+            return 0
+        return remaining_checks
     remaining = remaining_checks - 1
     logger.warning(
         "Adapter gradients are all zero at update %d (with_grad=%d/%d, checks_left=%d)",
